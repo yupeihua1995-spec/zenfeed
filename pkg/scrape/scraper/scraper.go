@@ -17,7 +17,15 @@ package scraper
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	stderrors "errors"
+	"net/url"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/benbjohnson/clock"
@@ -41,6 +49,37 @@ var clk = clock.New()
 type Scraper interface {
 	component.Component
 	Config() *Config
+	Status() Status
+	Trigger() error
+}
+
+type StatusState string
+
+const (
+	StatusNever    StatusState = "never"
+	StatusIdle     StatusState = "idle"
+	StatusRunning  StatusState = "running"
+	StatusError    StatusState = "error"
+	StatusDisabled StatusState = "disabled"
+)
+
+var ErrAlreadyRunning = stderrors.New("scrape is already running")
+
+type Status struct {
+	Name                string      `json:"name"`
+	State               StatusState `json:"state"`
+	LastAttemptAt       *time.Time  `json:"last_attempt_at,omitempty"`
+	LastSuccessAt       *time.Time  `json:"last_success_at,omitempty"`
+	NextRunAt           *time.Time  `json:"next_run_at,omitempty"`
+	LastReceivedCount   int         `json:"last_received_count"`
+	LastAppendedCount   int         `json:"last_appended_count"`
+	ConsecutiveFailures int         `json:"consecutive_failures"`
+	LastError           string      `json:"last_error,omitempty"`
+}
+
+type persistedStatus struct {
+	Fingerprint string `json:"fingerprint"`
+	Status
 }
 
 type Config struct {
@@ -118,7 +157,9 @@ func new(instance string, config *Config, dependencies Dependencies) (Scraper, e
 			Config:       config,
 			Dependencies: dependencies,
 		}),
-		source: source,
+		source:  source,
+		trigger: make(chan struct{}, 1),
+		status:  Status{Name: config.Name, State: StatusNever},
 	}, nil
 }
 
@@ -127,7 +168,11 @@ func new(instance string, config *Config, dependencies Dependencies) (Scraper, e
 type scraper struct {
 	*component.Base[Config, Dependencies]
 
-	source reader
+	source   reader
+	trigger  chan struct{}
+	busy     atomic.Bool
+	statusMu sync.RWMutex
+	status   Status
 }
 
 func (s *scraper) Run() (err error) {
@@ -137,6 +182,8 @@ func (s *scraper) Run() (err error) {
 	// Add random offset to avoid synchronized scraping.
 	offset := timeutil.Random(time.Minute)
 	log.Debug(ctx, "computed scrape offset", "offset", offset)
+	s.loadStatus()
+	s.setNextRun(clk.Now().Add(offset))
 
 	timer := time.NewTimer(offset)
 	defer timer.Stop()
@@ -146,46 +193,211 @@ func (s *scraper) Run() (err error) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			s.scrapeUntilSuccess(ctx)
+			if s.busy.CompareAndSwap(false, true) {
+				s.scrapeUntilSuccess(ctx)
+				s.busy.Store(false)
+			}
 			timer.Reset(s.Config().Interval)
+			s.setNextRun(clk.Now().Add(s.Config().Interval))
+		case <-s.trigger:
+			s.scrapeOnceAndRecord(ctx)
+			s.busy.Store(false)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(s.Config().Interval)
+			s.setNextRun(clk.Now().Add(s.Config().Interval))
 		}
 	}
 }
 
 func (s *scraper) scrapeUntilSuccess(ctx context.Context) {
-	_ = retry.Backoff(ctx, func() (err error) {
-		opCtx := telemetry.StartWith(ctx, append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "scrape")...)
-		defer func() { telemetry.End(opCtx, err) }()
-		timeout := 20 * time.Minute // For llm rewrite, it may take a long time.
-		opCtx, cancel := context.WithTimeout(opCtx, timeout)
-		defer cancel()
-
-		// Read feeds from source.
-		feeds, err := s.source.Read(opCtx)
-		if err != nil {
-			return errors.Wrap(err, "reading source feeds")
-		}
-		log.Debug(opCtx, "reading source feeds success", "count", len(feeds))
-
-		// Process feeds.
-		processed := s.processFeeds(ctx, feeds)
-		log.Debug(opCtx, "processed feeds", "count", len(processed))
-		if len(processed) == 0 {
-			return nil
-		}
-
-		// Save processed feeds.
-		if err := s.Dependencies().FeedStorage.Append(opCtx, processed...); err != nil {
-			return errors.Wrap(err, "saving feeds")
-		}
-		log.Debug(opCtx, "appending feeds success")
-
-		return nil
+	_ = retry.Backoff(ctx, func() error {
+		return s.scrapeOnceAndRecord(ctx)
 	}, &retry.Options{
 		MinInterval: time.Minute,
 		MaxInterval: 16 * time.Minute,
 		MaxAttempts: retry.InfAttempts,
 	})
+}
+
+func (s *scraper) scrapeOnceAndRecord(ctx context.Context) (err error) {
+	s.setStatusState(StatusRunning)
+	attemptedAt := clk.Now()
+	received, appended := 0, 0
+	defer func() { s.recordAttempt(attemptedAt, received, appended, err) }()
+
+	opCtx := telemetry.StartWith(ctx, append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "scrape")...)
+	defer func() { telemetry.End(opCtx, err) }()
+	opCtx, cancel := context.WithTimeout(opCtx, 20*time.Minute)
+	defer cancel()
+
+	feeds, err := s.source.Read(opCtx)
+	if err != nil {
+		return errors.Wrap(err, "reading source feeds")
+	}
+	received = len(feeds)
+	log.Debug(opCtx, "reading source feeds success", "count", received)
+
+	processed := s.processFeeds(opCtx, feeds)
+	appended = len(processed)
+	log.Debug(opCtx, "processed feeds", "count", appended)
+	if appended == 0 {
+		return nil
+	}
+	if err := s.Dependencies().FeedStorage.Append(opCtx, processed...); err != nil {
+		return errors.Wrap(err, "saving feeds")
+	}
+	log.Debug(opCtx, "appending feeds success")
+
+	return nil
+}
+
+func (s *scraper) Trigger() error {
+	if !s.busy.CompareAndSwap(false, true) {
+		return ErrAlreadyRunning
+	}
+	s.setStatusState(StatusRunning)
+	select {
+	case s.trigger <- struct{}{}:
+		return nil
+	default:
+		s.busy.Store(false)
+		return ErrAlreadyRunning
+	}
+}
+
+func (s *scraper) Status() Status {
+	s.statusMu.RLock()
+	status := s.status
+	s.statusMu.RUnlock()
+
+	return status
+}
+
+func (s *scraper) setStatusState(state StatusState) {
+	s.statusMu.Lock()
+	s.status.State = state
+	s.statusMu.Unlock()
+}
+
+func (s *scraper) setNextRun(next time.Time) {
+	s.statusMu.Lock()
+	s.status.NextRunAt = &next
+	s.statusMu.Unlock()
+}
+
+func (s *scraper) recordAttempt(attemptedAt time.Time, received, appended int, attemptErr error) {
+	s.statusMu.Lock()
+	s.status.LastAttemptAt = &attemptedAt
+	s.status.LastReceivedCount = received
+	s.status.LastAppendedCount = appended
+	if attemptErr != nil {
+		s.status.State = StatusError
+		s.status.ConsecutiveFailures++
+		s.status.LastError = sanitizeStatusError(attemptErr)
+	} else {
+		s.status.State = StatusIdle
+		succeededAt := clk.Now()
+		s.status.LastSuccessAt = &succeededAt
+		s.status.ConsecutiveFailures = 0
+		s.status.LastError = ""
+	}
+	status := s.status
+	s.statusMu.Unlock()
+	s.persistStatus(status)
+}
+
+func (s *scraper) statusFingerprint() string {
+	return configFingerprint(s.Config())
+}
+
+func configFingerprint(config *Config) string {
+	b, _ := json.Marshal(config)
+	sum := sha256.Sum256(b)
+
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *scraper) statusKey() []byte {
+	return persistedStatusKey(s.Config().Name)
+}
+
+func persistedStatusKey(name string) []byte {
+	sum := sha256.Sum256([]byte(name))
+
+	return []byte("scraper.status." + hex.EncodeToString(sum[:]))
+}
+
+func (s *scraper) persistStatus(status Status) {
+	b, err := json.Marshal(persistedStatus{Fingerprint: s.statusFingerprint(), Status: status})
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Dependencies().KVStorage.Set(ctx, s.statusKey(), b, 0); err != nil {
+		log.Error(s.Context(), errors.Wrap(err, "persist scraper status"))
+	}
+}
+
+func (s *scraper) loadStatus() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	status := LoadPersistedStatus(ctx, s.Dependencies().KVStorage, s.Config())
+	if status.LastAttemptAt == nil {
+		return
+	}
+	s.statusMu.Lock()
+	s.status = status
+	s.statusMu.Unlock()
+}
+
+func LoadPersistedStatus(ctx context.Context, storage kv.Storage, config *Config) Status {
+	status := Status{Name: config.Name, State: StatusNever}
+	b, err := storage.Get(ctx, persistedStatusKey(config.Name))
+	if err != nil {
+		return status
+	}
+	var persisted persistedStatus
+	if json.Unmarshal(b, &persisted) != nil || persisted.Fingerprint != configFingerprint(config) {
+		return status
+	}
+	persisted.Status.Name = config.Name
+	persisted.Status.NextRunAt = nil
+	if persisted.Status.LastAttemptAt == nil {
+		persisted.Status.State = StatusNever
+	} else if persisted.Status.LastError != "" {
+		persisted.Status.State = StatusError
+	} else {
+		persisted.Status.State = StatusIdle
+	}
+
+	return persisted.Status
+}
+
+func sanitizeStatusError(err error) string {
+	parts := strings.Fields(err.Error())
+	for i, part := range parts {
+		trimmed := strings.Trim(part, "\"'(),:")
+		parsed, parseErr := url.Parse(trimmed)
+		if parseErr != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			continue
+		}
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		parts[i] = strings.Replace(part, trimmed, parsed.String(), 1)
+	}
+	message := strings.Join(parts, " ")
+	if runes := []rune(message); len(runes) > 300 {
+		message = string(runes[:300])
+	}
+
+	return message
 }
 
 func (s *scraper) processFeeds(ctx context.Context, feeds []*model.Feed) []*model.Feed {
@@ -255,12 +467,14 @@ func (s *scraper) filterExists(ctx context.Context, feeds []*model.Feed) (filter
 			if err != nil {
 				log.Error(ctx, err, "parse last try stored time, fallback to continue writing")
 				appendToResult(feed)
+				continue
 			}
 
 			exists, err := s.Dependencies().FeedStorage.Exists(ctx, feed.ID, t)
 			if err != nil {
 				log.Error(ctx, err, "check feed exists, fallback to continue writing")
 				appendToResult(feed)
+				continue
 			}
 			if !exists {
 				appendToResult(feed)
@@ -292,3 +506,7 @@ func (s *mockScraper) Config() *Config {
 
 	return args.Get(0).(*Config)
 }
+
+func (s *mockScraper) Status() Status { return Status{} }
+
+func (s *mockScraper) Trigger() error { return nil }

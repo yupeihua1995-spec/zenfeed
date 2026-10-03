@@ -17,6 +17,7 @@ package notify
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -219,11 +220,18 @@ func new(instance string, app *config.App, dependencies Dependencies) (Notifier,
 		return nil, errors.Wrap(err, "create router")
 	}
 	n.router = router
+	n.routerRun = newComponentLifecycle(router)
 	channel, err := n.newChannel(&config.Channels)
 	if err != nil {
-		return nil, errors.Wrap(err, "create channel")
+		closeErr := router.Close()
+
+		return nil, stderrors.Join(
+			errors.Wrap(err, "create channel"),
+			errors.Wrap(closeErr, "close router after channel creation failure"),
+		)
 	}
 	n.channel = channel
+	n.channelRun = newComponentLifecycle(channel)
 
 	return n, nil
 }
@@ -234,8 +242,16 @@ type notifier struct {
 
 	router          route.Router
 	channel         channel.Channel
+	routerRun       *componentLifecycle
+	channelRun      *componentLifecycle
 	channelSendWork chan sendWork
 	mu              sync.RWMutex
+	reloadMu        sync.Mutex
+	workerWG        sync.WaitGroup
+	closeOnce       sync.Once
+	closeErr        error
+	closed          bool
+	generation      uint64
 }
 
 var sendConcurrency = runtime.NumCPU() * 2
@@ -244,42 +260,143 @@ func (n *notifier) Run() (err error) {
 	ctx := telemetry.StartWith(n.Context(), append(n.TelemetryLabels(), telemetrymodel.KeyOperation, "Run")...)
 	defer func() { telemetry.End(ctx, err) }()
 
-	if err := component.RunUntilReady(n.Context(), n.router, 10*time.Second); err != nil {
-		return errors.Wrap(err, "router not ready")
-	}
-	if err := component.RunUntilReady(n.Context(), n.channel, 10*time.Second); err != nil {
-		return errors.Wrap(err, "channel not ready")
+	n.reloadMu.Lock()
+	if n.closed || n.Context().Err() != nil {
+		n.reloadMu.Unlock()
+
+		return nil
 	}
 
+	if err := n.routerRun.runUntilReady(n.Context(), 10*time.Second); err != nil {
+		closeErr := closeNotifierChildren(n.routerRun, n.channelRun)
+		n.reloadMu.Unlock()
+
+		if n.Context().Err() != nil {
+			return nil
+		}
+
+		return stderrors.Join(errors.Wrap(err, "router not ready"), closeErr)
+	}
+	if err := n.channelRun.runUntilReady(n.Context(), 10*time.Second); err != nil {
+		closeErr := closeNotifierChildren(n.routerRun, n.channelRun)
+		n.reloadMu.Unlock()
+
+		if n.Context().Err() != nil {
+			return nil
+		}
+
+		return stderrors.Join(errors.Wrap(err, "channel not ready"), closeErr)
+	}
+	if err := notifierChildrenRunError(n.routerRun, n.channelRun); err != nil {
+		closeErr := closeNotifierChildren(n.routerRun, n.channelRun)
+		n.reloadMu.Unlock()
+
+		if n.Context().Err() != nil {
+			return nil
+		}
+
+		return stderrors.Join(err, closeErr)
+	}
+
+	if n.closed || n.Context().Err() != nil {
+		closeErr := closeNotifierChildren(n.routerRun, n.channelRun)
+		n.reloadMu.Unlock()
+
+		return closeErr
+	}
+	n.mu.Lock()
+	if n.generation == 0 {
+		n.generation = 1
+	}
+	n.mu.Unlock()
+	n.workerWG.Add(sendConcurrency)
 	for i := range sendConcurrency {
-		go n.sendWorker(i)
+		go func() {
+			defer n.workerWG.Done()
+			n.sendWorker(i)
+		}()
 	}
 
 	n.MarkReady()
+	n.reloadMu.Unlock()
+
+	in := n.Dependencies().In
 	for {
+		generation, routerRun, channelRun := n.childGeneration()
 		select {
 		case <-ctx.Done():
 			return nil
-		case result := <-n.Dependencies().In:
+		case <-routerRun.done:
+			if childErr, current := n.currentChildError(generation, routerRun, true); current {
+				return childErr
+			}
+		case <-channelRun.done:
+			if childErr, current := n.currentChildError(generation, channelRun, false); current {
+				return childErr
+			}
+		case result, ok := <-in:
+			if !ok {
+				in = nil
+
+				continue
+			}
 			n.handle(ctx, result)
 		}
 	}
 }
 
+func (n *notifier) childGeneration() (uint64, *componentLifecycle, *componentLifecycle) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	return n.generation, n.routerRun, n.channelRun
+}
+
+func (n *notifier) currentChildError(
+	generation uint64,
+	child *componentLifecycle,
+	routerChild bool,
+) (error, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	if n.closed || n.Context().Err() != nil || n.generation != generation {
+		return nil, false
+	}
+	childName := "channel"
+	if routerChild {
+		if n.routerRun != child {
+			return nil, false
+		}
+		childName = "router"
+	} else if n.channelRun != child {
+		return nil, false
+	}
+
+	return errors.Wrapf(child.unexpectedRunError(), "%s exited", childName), true
+}
+
 func (n *notifier) Close() error {
-	if err := n.Base.Close(); err != nil {
-		return errors.Wrap(err, "close base")
-	}
-	if err := n.router.Close(); err != nil {
-		return errors.Wrap(err, "close router")
-	}
-	if err := n.channel.Close(); err != nil {
-		return errors.Wrap(err, "close channel")
-	}
+	n.closeOnce.Do(func() {
+		var closeErrs []error
+		if err := n.Base.Close(); err != nil {
+			closeErrs = append(closeErrs, errors.Wrap(err, "close base"))
+		}
 
-	close(n.channelSendWork)
+		n.reloadMu.Lock()
+		n.mu.Lock()
+		n.closed = true
+		n.mu.Unlock()
+		n.workerWG.Wait()
+		if err := closeNotifierChildren(n.routerRun, n.channelRun); err != nil {
+			closeErrs = append(closeErrs, err)
+		}
+		n.reloadMu.Unlock()
 
-	return nil
+		n.closeErr = stderrors.Join(closeErrs...)
+	})
+
+	return n.closeErr
 }
 
 func (n *notifier) Reload(app *config.App) error {
@@ -287,6 +404,13 @@ func (n *notifier) Reload(app *config.App) error {
 	newConfig.From(app)
 	if err := newConfig.Validate(); err != nil {
 		return errors.Wrap(err, "invalid config")
+	}
+
+	n.reloadMu.Lock()
+	defer n.reloadMu.Unlock()
+
+	if n.closed || n.Context().Err() != nil {
+		return nil
 	}
 	if reflect.DeepEqual(n.Config(), newConfig) {
 		log.Debug(n.Context(), "no changes in notify config")
@@ -298,32 +422,198 @@ func (n *notifier) Reload(app *config.App) error {
 	if err != nil {
 		return errors.Wrap(err, "create router")
 	}
-	if component.RunUntilReady(n.Context(), router, 10*time.Second) != nil {
-		return errors.New("router not ready")
+	routerRun := newComponentLifecycle(router)
+	if err := routerRun.runUntilReady(n.Context(), 10*time.Second); err != nil {
+		closeErr := routerRun.stop()
+
+		return stderrors.Join(
+			errors.Wrap(err, "router not ready"),
+			errors.Wrap(closeErr, "close new router"),
+		)
 	}
 
 	channel, err := n.newChannel(&channel.Config{Email: newConfig.Channels.Email})
 	if err != nil {
-		return errors.Wrap(err, "create email")
-	}
-	if component.RunUntilReady(n.Context(), channel, 10*time.Second) != nil {
-		return errors.New("channel not ready")
-	}
+		closeErr := routerRun.stop()
 
-	if err := n.router.Close(); err != nil {
-		log.Error(n.Context(), errors.Wrap(err, "close router"))
+		return stderrors.Join(
+			errors.Wrap(err, "create channel"),
+			errors.Wrap(closeErr, "close new router"),
+		)
 	}
-	if err := n.channel.Close(); err != nil {
-		log.Error(n.Context(), errors.Wrap(err, "close channel"))
+	channelRun := newComponentLifecycle(channel)
+	if err := channelRun.runUntilReady(n.Context(), 10*time.Second); err != nil {
+		closeErr := closeNotifierChildren(routerRun, channelRun)
+
+		return stderrors.Join(
+			errors.Wrap(err, "channel not ready"),
+			closeErr,
+		)
+	}
+	if err := notifierChildrenRunError(routerRun, channelRun); err != nil {
+		return stderrors.Join(err, closeNotifierChildren(routerRun, channelRun))
 	}
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	if n.closed || n.Context().Err() != nil {
+		n.mu.Unlock()
+		if err := closeNotifierChildren(routerRun, channelRun); err != nil {
+			log.Error(n.Context(), errors.Wrap(err, "close staged notifier children"))
+		}
+
+		return nil
+	}
+	oldRouterRun := n.routerRun
+	oldChannelRun := n.channelRun
 	n.SetConfig(newConfig)
 	n.router = router
 	n.channel = channel
+	n.routerRun = routerRun
+	n.channelRun = channelRun
+	n.generation++
+	n.mu.Unlock()
+
+	if err := closeNotifierChildren(oldRouterRun, oldChannelRun); err != nil {
+		log.Error(n.Context(), err)
+	}
 
 	return nil
+}
+
+func closeNotifierChildren(routerRun, channelRun *componentLifecycle) error {
+	closeErrs := make([]error, 2)
+	var wg sync.WaitGroup
+	if routerRun != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			closeErrs[0] = errors.Wrap(routerRun.stop(), "close router")
+		}()
+	}
+	if channelRun != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			closeErrs[1] = errors.Wrap(channelRun.stop(), "close channel")
+		}()
+	}
+	wg.Wait()
+
+	return stderrors.Join(closeErrs...)
+}
+
+func notifierChildrenRunError(routerRun, channelRun *componentLifecycle) error {
+	if err := notifierChildRunError("router", routerRun); err != nil {
+		return err
+	}
+
+	return notifierChildRunError("channel", channelRun)
+}
+
+func notifierChildRunError(name string, child *componentLifecycle) error {
+	if child == nil {
+		return nil
+	}
+	select {
+	case <-child.done:
+		return errors.Wrapf(child.unexpectedRunError(), "%s exited", name)
+	default:
+		return nil
+	}
+}
+
+type componentLifecycle struct {
+	component component.Component
+	done      chan struct{}
+	mu        sync.Mutex
+	started   bool
+	stopping  bool
+	runErr    error
+	exitErr   error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newComponentLifecycle(c component.Component) *componentLifecycle {
+	return &componentLifecycle{component: c, done: make(chan struct{})}
+}
+
+func (r *componentLifecycle) runUntilReady(ctx context.Context, timeout time.Duration) error {
+	r.mu.Lock()
+	if r.stopping {
+		r.mu.Unlock()
+
+		return errors.New("component lifecycle is stopping")
+	}
+	if !r.started {
+		r.started = true
+		go func() {
+			err := r.component.Run()
+			r.mu.Lock()
+			r.runErr = err
+			if !r.stopping {
+				r.exitErr = err
+			}
+			r.mu.Unlock()
+			close(r.done)
+		}()
+	}
+	r.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-r.component.Ready():
+		select {
+		case <-r.done:
+			return stderrors.Join(r.unexpectedRunError(), r.stop())
+		default:
+			return nil
+		}
+	case <-r.done:
+		return stderrors.Join(r.unexpectedRunError(), r.stop())
+	case <-timer.C:
+		return stderrors.Join(errors.New("component not ready after timeout"), r.stop())
+	case <-ctx.Done():
+		return stderrors.Join(ctx.Err(), r.stop())
+	}
+}
+
+func (r *componentLifecycle) stop() error {
+	if r == nil {
+		return nil
+	}
+
+	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		r.stopping = true
+		started := r.started
+		r.mu.Unlock()
+
+		closeErr := r.component.Close()
+		if started {
+			<-r.done
+		}
+		r.closeErr = stderrors.Join(closeErr, r.exitError())
+	})
+
+	return r.closeErr
+}
+
+func (r *componentLifecycle) unexpectedRunError() error {
+	if runErr := r.exitError(); runErr != nil {
+		return runErr
+	}
+
+	return errors.New("component exited before shutdown")
+}
+
+func (r *componentLifecycle) exitError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.exitErr
 }
 
 func (n *notifier) newRouter(config *route.Config) (route.Router, error) {
@@ -347,8 +637,11 @@ func (n *notifier) newChannel(config *channel.Config) (channel.Channel, error) {
 
 func (n *notifier) handle(ctx context.Context, result *rule.Result) {
 	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.closed {
+		return
+	}
 	router := n.router
-	n.mu.RUnlock()
 
 	groups, err := router.Route(ctx, result)
 	if err != nil {
@@ -378,9 +671,12 @@ func (n *notifier) trySummitSendWork(ctx context.Context, group *route.Group, re
 
 		return
 	}
-	n.channelSendWork <- sendWork{
+	select {
+	case n.channelSendWork <- sendWork{
 		group:    &group.FeedGroup,
 		receiver: *receiver,
+	}:
+	case <-ctx.Done():
 	}
 }
 
@@ -390,28 +686,35 @@ func (n *notifier) sendWorker(i int) {
 		case <-n.Context().Done():
 			return
 		case work := <-n.channelSendWork:
-			workCtx := telemetry.StartWith(n.Context(),
-				append(n.TelemetryLabels(),
-					telemetrymodel.KeyOperation, "Run",
-					"worker", i,
-					"group", work.group.Name,
-					"time", timeutil.Format(work.group.Time),
-					"receiver", work.receiver.Name,
-				)...,
-			)
-			defer func() { telemetry.End(workCtx, nil) }()
-
-			workCtx, cancel := context.WithTimeout(workCtx, 30*time.Second)
-			defer cancel()
-
-			if err := n.duplicateSend(workCtx, work); err != nil {
-				log.Error(workCtx, err, "duplicate send")
-
-				continue
+			if n.Context().Err() != nil {
+				return
 			}
-			log.Info(workCtx, "send success")
+			n.processSendWork(i, work)
 		}
 	}
+}
+
+func (n *notifier) processSendWork(i int, work sendWork) {
+	spanCtx := telemetry.StartWith(n.Context(),
+		append(n.TelemetryLabels(),
+			telemetrymodel.KeyOperation, "Run",
+			"worker", i,
+			"group", work.group.Name,
+			"time", timeutil.Format(work.group.Time),
+			"receiver", work.receiver.Name,
+		)...,
+	)
+	defer func() { telemetry.End(spanCtx, nil) }()
+
+	workCtx, cancel := context.WithTimeout(spanCtx, 30*time.Second)
+	defer cancel()
+
+	if err := n.duplicateSend(workCtx, work); err != nil {
+		log.Error(workCtx, err, "duplicate send")
+
+		return
+	}
+	log.Info(workCtx, "send success")
 }
 
 func (n *notifier) duplicateSend(ctx context.Context, work sendWork) error {
@@ -432,8 +735,11 @@ func (n *notifier) duplicateSend(ctx context.Context, work sendWork) error {
 
 func (n *notifier) send(ctx context.Context, work sendWork) error {
 	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.closed {
+		return context.Canceled
+	}
 	channel := n.channel
-	n.mu.RUnlock()
 
 	return channel.Send(ctx, work.receiver.Receiver, work.group)
 }

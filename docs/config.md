@@ -14,7 +14,7 @@
 
 | Field                 | Type     | Description                                                                        | Default Value         | Required |
 | :-------------------- | :------- | :--------------------------------------------------------------------------------- | :-------------------- | :------- |
-| `telemetry.address`   | `string` | Exposes Prometheus metrics & pprof.                                                | `:9090`               | No       |
+| `telemetry.address`   | `string` | Exposes Prometheus metrics & pprof. Bind explicitly to `0.0.0.0:9090` only behind trusted network controls. | `127.0.0.1:9090` | No |
 | `telemetry.log`       | `object` | Log configuration related to telemetry.                                            | (See specific fields) | No       |
 | `telemetry.log.level` | `string` | Log level for telemetry-related messages, one of `debug`, `info`, `warn`, `error`. | `info`                | No       |
 
@@ -23,9 +23,12 @@
 | Field              | Type     | Description                                                                                                                  | Default Value                 | Required               |
 | :----------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------- | :---------------------------- | :--------------------- |
 | `api.http`         | `object` | HTTP API configuration.                                                                                                      | (See specific fields)         | No                     |
-| `api.http.address` | `string` | Address for the HTTP API (`[host]:port`). E.g., `0.0.0.0:1300`. Cannot be changed after the application starts.              | `:1300`                       | No                     |
+| `api.http.address` | `string` | Address for the HTTP API (`[host]:port`). E.g., `0.0.0.0:1300`. Cannot be changed after the application starts.              | `127.0.0.1:1300`              | No                     |
+| `api.http.allowed_origins` | `list of strings` | Exact browser origins allowed to call the API. Wildcards are not supported; an explicit empty list disables cross-origin access. Add `https://zenfeed-web.pages.dev` explicitly if using the hosted demo against your API. | `http://localhost:1400`, `http://127.0.0.1:1400` | No |
 | `api.mcp`          | `object` | MCP API configuration.                                                                                                       | (See specific fields)         | No                     |
-| `api.mcp.address`  | `string` | Address for the MCP API (`[host]:port`). E.g., `0.0.0.0:1301`. Cannot be changed after the application starts.               | `:1301`                       | No                     |
+| `api.mcp.address`  | `string` | Address for the MCP API (`[host]:port`). E.g., `0.0.0.0:1301`. Cannot be changed after the application starts.               | `127.0.0.1:1301`              | No                     |
+| `api.rss`          | `object` | RSS API configuration.                                                                                                      | (See specific fields)         | No                     |
+| `api.rss.address`  | `string` | Address for the RSS API (`[host]:port`). E.g., `0.0.0.0:1302`. Cannot be changed after the application starts.               | `127.0.0.1:1302`              | No                     |
 | `api.llm`          | `string` | Name of the LLM used for summarizing feeds. E.g., `my-favorite-gemini-king`. Refers to an LLM defined in the `llms` section. | Default LLM in `llms` section | Yes (if using summary) |
 
 ### LLM Configuration (`llms[]`)
@@ -224,3 +227,9 @@ Configures *how* notifications are sent.
 | `...email.password`                   | `string` | App-specific password for the sender's email. (For Gmail, see [Google App Passwords](https://support.google.com/mail/answer/185833)).                                                               |                  | Yes      |
 | `...email.feed_markdown_template`     | `string` | Markdown template for formatting each feed in the email body. Renders feed content by default. Cannot be set with `feed_html_snippet_template`. Available template variables depend on feed labels. | `{{ .content }}` | No       |
 | `...email.feed_html_snippet_template` | `string` | HTML snippet template for formatting each feed. Cannot be set with `feed_markdown_template`. Available template variables depend on feed labels.                                                    |                  | No       |
+
+### Optimistic configuration updates
+
+`POST /query_config` includes an opaque top-level `_revision` value. Clients must send that value back unchanged in the next `POST /apply_config` request. A missing revision returns HTTP `428`; a stale revision returns HTTP `409` instead of overwriting a newer API update. Query again and rebuild the complete update after either response. Revision checks serialize updates made through this running Zenfeed process only: a direct file edit can still race the final POSIX rename because the filesystem does not provide compare-and-swap rename. Never edit the configuration file concurrently with an API update; stop Zenfeed or otherwise guarantee exclusive access first.
+
+Secret values are returned as the reserved `<redacted>` placeholder. Leave that placeholder unchanged to preserve the existing LLM, Jina, RSSHub, object-storage, SMTP, or webhook credential; replace it only when intentionally rotating the secret. LLM names and notification receiver names must be unique because secret placeholders are matched by name. The JSON API accepts only `POST` (plus `OPTIONS` discovery), has no permissive cross-origin policy by default, and listens on loopback by default. Request bodies are limited to 1 MiB, except `/write`, which permits 8 MiB and at most 1,000 feeds with 6 MiB of label data. Browser deployments should use the same-origin web proxy; remote access must use an authenticated reverse proxy rather than exposing these management endpoints directly.

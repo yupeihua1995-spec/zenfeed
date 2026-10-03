@@ -16,9 +16,11 @@
 package http
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -33,15 +35,25 @@ import (
 // --- Interface code block ---
 type Server interface {
 	component.Component
+	config.Watcher
 }
 
 type Config struct {
 	Address string
 }
 
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 2 * time.Minute
+	idleTimeout       = 2 * time.Minute
+	shutdownTimeout   = 10 * time.Second
+	maxHeaderBytes    = 1 << 20
+)
+
 func (c *Config) Validate() error {
 	if c.Address == "" {
-		c.Address = ":9090"
+		c.Address = "127.0.0.1:9090"
 	}
 	if _, _, err := net.SplitHostPort(c.Address); err != nil {
 		return errors.Wrap(err, "invalid address")
@@ -102,7 +114,15 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 			Config:       config,
 			Dependencies: dependencies,
 		}),
-		http: &http.Server{Addr: config.Address, Handler: router},
+		http: &http.Server{
+			Addr:              config.Address,
+			Handler:           router,
+			ReadHeaderTimeout: readHeaderTimeout,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    maxHeaderBytes,
+		},
 	}, nil
 }
 
@@ -116,9 +136,14 @@ func (s *server) Run() (err error) {
 	ctx := telemetry.StartWith(s.Context(), append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "Run")...)
 	defer func() { telemetry.End(ctx, err) }()
 
+	listener, err := net.Listen("tcp", s.http.Addr)
+	if err != nil {
+		return errors.Wrap(err, "listen")
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
-		serverErr <- s.http.ListenAndServe()
+		serverErr <- s.http.Serve(listener)
 	}()
 
 	s.MarkReady()
@@ -126,12 +151,48 @@ func (s *server) Run() (err error) {
 	case <-ctx.Done():
 		log.Info(ctx, "shutting down")
 
-		return s.http.Shutdown(ctx)
+		return shutdownHTTPServer(s.http)
 	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return errors.Wrap(err, "listen and serve")
 	}
 }
 
+func shutdownHTTPServer(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		if closeErr := server.Close(); closeErr != nil {
+			return errors.Wrapf(err, "shutdown server; force close: %v", closeErr)
+		}
+
+		return errors.Wrap(err, "shutdown server; connections force-closed")
+	}
+
+	return nil
+}
+
+func (s *server) Reload(app *config.App) error {
+	newConfig := &Config{}
+	newConfig.From(app)
+	if err := newConfig.Validate(); err != nil {
+		return errors.Wrap(err, "validate config")
+	}
+	if s.Config().Address != newConfig.Address {
+		return errors.New("address cannot be reloaded")
+	}
+
+	s.SetConfig(newConfig)
+
+	return nil
+}
+
 type mockServer struct {
 	component.Mock
+}
+
+func (m *mockServer) Reload(app *config.App) error {
+	return m.Called(app).Error(0)
 }

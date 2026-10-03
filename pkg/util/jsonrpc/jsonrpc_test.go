@@ -228,3 +228,92 @@ func TestAPI(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIRequestHardening_BitsUT(t *testing.T) {
+	type request struct {
+		Name string `json:"name"`
+	}
+	type response struct{}
+
+	called := 0
+	handler := API(func(ctx context.Context, req *request) (*response, error) {
+		called++
+
+		return &response{}, nil
+	})
+
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		t.Run("rejects "+method, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(method, "/test", nil))
+
+			NewWithT(t).Expect(rec.Code).To(Equal(http.StatusMethodNotAllowed))
+			NewWithT(t).Expect(rec.Header().Get("Allow")).To(Equal("POST, OPTIONS"))
+		})
+	}
+
+	t.Run("allows preflight without invoking handler", func(t *testing.T) {
+		g := NewWithT(t)
+		before := called
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodOptions, "/test", nil))
+
+		g.Expect(rec.Code).To(Equal(http.StatusOK))
+		g.Expect(rec.Header().Get("Allow")).To(Equal("POST, OPTIONS"))
+		g.Expect(rec.Header().Get("Access-Control-Allow-Origin")).To(BeEmpty())
+		g.Expect(called).To(Equal(before))
+	})
+
+	for _, body := range []string{
+		`{"name":"first"}{"name":"second"}`,
+		`{"name":"first"} trailing`,
+	} {
+		t.Run("rejects trailing JSON data", func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/test", bytes.NewBufferString(body)))
+
+			NewWithT(t).Expect(rec.Code).To(Equal(http.StatusBadRequest))
+		})
+	}
+
+	t.Run("rejects request bodies larger than one MiB", func(t *testing.T) {
+		g := NewWithT(t)
+		body := `{"name":"` + string(bytes.Repeat([]byte("x"), (1<<20)+1)) + `"}`
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/test", bytes.NewBufferString(body)))
+
+		g.Expect(rec.Code).To(Equal(http.StatusRequestEntityTooLarge))
+	})
+
+	t.Run("allows a larger route-specific body limit", func(t *testing.T) {
+		g := NewWithT(t)
+		largeHandler := APIWithLimit(func(ctx context.Context, req *request) (*response, error) {
+			return &response{}, nil
+		}, WriteMaxRequestBodyBytes)
+		body := `{"name":"` + string(bytes.Repeat([]byte("x"), (1<<20)+1)) + `"}`
+		rec := httptest.NewRecorder()
+		largeHandler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/test", bytes.NewBufferString(body)))
+
+		g.Expect(rec.Code).To(Equal(http.StatusOK))
+	})
+
+	t.Run("accepts a body without content type for compatibility", func(t *testing.T) {
+		g := NewWithT(t)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(
+			http.MethodPost, "/test", bytes.NewBufferString(`{"name":"ok"}`),
+		))
+
+		g.Expect(rec.Code).To(Equal(http.StatusOK))
+	})
+
+	t.Run("rejects an explicitly unsupported content type", func(t *testing.T) {
+		g := NewWithT(t)
+		req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewBufferString(`{"name":"ok"}`))
+		req.Header.Set("Content-Type", "text/plain")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		g.Expect(rec.Code).To(Equal(http.StatusUnsupportedMediaType))
+	})
+}

@@ -116,10 +116,15 @@ func (r *watch) execute(ctx context.Context, start, end time.Time) error {
 
 	// Notify.
 	for start, feeds := range feedsByStart {
-		r.Dependencies().Out <- &Result{
+		result := &Result{
 			Rule:  config.Name,
 			Time:  start,
 			Feeds: feeds,
+		}
+		select {
+		case r.Dependencies().Out <- result:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	log.Debug(ctx, "rule notified", "feeds", len(feedsByStart))

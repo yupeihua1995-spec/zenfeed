@@ -18,6 +18,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"io"
 	"reflect"
 	"strconv"
@@ -39,6 +40,7 @@ import (
 	binaryutil "github.com/glidea/zenfeed/pkg/util/binary"
 	"github.com/glidea/zenfeed/pkg/util/buffer"
 	"github.com/glidea/zenfeed/pkg/util/hash"
+	"github.com/glidea/zenfeed/pkg/util/lifecycle"
 )
 
 // --- Interface code block ---
@@ -163,10 +165,15 @@ func (c *FactoryConfig) Validate() error {
 		return errors.New("no llm config")
 	}
 
+	names := make(map[string]struct{}, len(c.LLMs))
 	for i := range c.LLMs {
 		if err := (&c.LLMs[i]).Validate(); err != nil {
 			return errors.Wrapf(err, "validate llm config %s", c.LLMs[i].Name)
 		}
+		if _, exists := names[c.LLMs[i].Name]; exists {
+			return errors.Errorf("llm name %q must be unique", c.LLMs[i].Name)
+		}
+		names[c.LLMs[i].Name] = struct{}{}
 	}
 
 	if len(c.LLMs) == 1 {
@@ -246,7 +253,8 @@ func NewFactory(
 			Config:       config,
 			Dependencies: dependencies,
 		}),
-		llms: make(map[string]LLM),
+		llms:       make(map[string]LLM),
+		childExits: make(chan llmExit, 1),
 	}
 	f.initLLMs()
 
@@ -256,31 +264,158 @@ func NewFactory(
 type factory struct {
 	*component.Base[FactoryConfig, FactoryDependencies]
 
-	defaultLLM LLM
-	llms       map[string]LLM
-	mu         sync.Mutex
+	defaultLLM  LLM
+	llms        map[string]LLM
+	ownedLLMs   map[string]*ownedLLM
+	mu          sync.Mutex
+	lifecycleMu sync.Mutex
+	closed      bool
+	starting    bool
+	running     bool
+	close       lifecycle.Once
+	childExits  chan llmExit
 }
 
-func (f *factory) Run() error {
-	for _, llm := range f.llms {
+type llmExit struct {
+	child *ownedLLM
+	err   error
+}
+
+type ownedLLM struct {
+	LLM
+	owner     *lifecycle.Owned
+	watchOnce sync.Once
+}
+
+func newOwnedLLM(child LLM) *ownedLLM {
+	return &ownedLLM{LLM: child, owner: lifecycle.NewOwned(child)}
+}
+
+func (l *ownedLLM) Run() error { return l.owner.Run() }
+
+func (l *ownedLLM) Close() error {
+	return l.owner.Close()
+}
+
+func (l *ownedLLM) watch(ctx context.Context, exits chan<- llmExit) {
+	l.watchOnce.Do(func() {
+		go func() {
+			<-l.owner.Done()
+			if err := l.owner.UnexpectedExit(); err != nil {
+				select {
+				case exits <- llmExit{child: l, err: err}:
+				case <-ctx.Done():
+				}
+			}
+		}()
+	})
+}
+
+func (f *factory) Run() (err error) {
+	f.lifecycleMu.Lock()
+	if f.closed {
+		f.lifecycleMu.Unlock()
+
+		return errors.New("factory is closed")
+	}
+	if f.childExits == nil {
+		f.childExits = make(chan llmExit, 1)
+	}
+	f.starting = true
+	llms := f.snapshotOwnedLLMs()
+	f.lifecycleMu.Unlock()
+
+	defer func() { err = stderrors.Join(err, f.Close()) }()
+	for _, llm := range llms {
 		if err := component.RunUntilReady(f.Context(), llm, 10*time.Second); err != nil {
 			return errors.Wrapf(err, "run llm %s", llm.Name())
 		}
+		llm.watch(f.Context(), f.childExits)
 	}
+	if err := initialLLMExit(llms); err != nil {
+		return err
+	}
+	f.lifecycleMu.Lock()
+	f.starting = false
+	f.running = true
+	f.lifecycleMu.Unlock()
 	f.MarkReady()
-	<-f.Context().Done()
+
+	for {
+		select {
+		case <-f.Context().Done():
+			return nil
+		case exit := <-f.childExits:
+			if f.isCurrentLLM(exit.child) {
+				return errors.Wrapf(exit.err, "LLM %s exited unexpectedly", exit.child.Instance())
+			}
+		}
+	}
+}
+
+func initialLLMExit(llms []*ownedLLM) error {
+	for _, llm := range llms {
+		select {
+		case <-llm.owner.Done():
+			return errors.Wrapf(llm.owner.UnexpectedExit(), "LLM %s exited during startup", llm.Instance())
+		default:
+		}
+	}
 
 	return nil
 }
 
 func (f *factory) Close() error {
+	return f.close.Do(func() error {
+		baseErr := f.Base.Close()
+
+		f.lifecycleMu.Lock()
+		f.mu.Lock()
+		f.closed = true
+		f.starting = false
+		f.running = false
+		llms := f.ownedLLMsLocked()
+		f.mu.Unlock()
+		f.lifecycleMu.Unlock()
+
+		return stderrors.Join(baseErr, lifecycle.CloseAll(llms...))
+	})
+}
+
+func (f *factory) snapshotOwnedLLMs() []*ownedLLM {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, llm := range f.llms {
-		_ = llm.Close()
+
+	return f.ownedLLMsLocked()
+}
+
+func (f *factory) ownedLLMsLocked() []*ownedLLM {
+	if f.ownedLLMs == nil {
+		f.ownedLLMs = make(map[string]*ownedLLM, len(f.llms))
+	}
+	llms := make([]*ownedLLM, 0, len(f.llms))
+	for name, llm := range f.llms {
+		owned, ok := f.ownedLLMs[name]
+		if !ok {
+			owned = newOwnedLLM(llm)
+			f.ownedLLMs[name] = owned
+		}
+		llms = append(llms, owned)
 	}
 
-	return nil
+	return llms
+}
+
+func (f *factory) isCurrentLLM(child *ownedLLM) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, current := range f.ownedLLMs {
+		if current == child {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (f *factory) Reload(app *config.App) error {
@@ -289,26 +424,70 @@ func (f *factory) Reload(app *config.App) error {
 	if err := newConfig.Validate(); err != nil {
 		return errors.Wrap(err, "validate config")
 	}
+
+	// Reload the LLMs.
+	f.lifecycleMu.Lock()
+	defer f.lifecycleMu.Unlock()
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+
+		return errors.New("factory is closed")
+	}
+	if f.starting {
+		f.mu.Unlock()
+
+		return errors.New("factory is starting")
+	}
 	if reflect.DeepEqual(f.Config(), newConfig) {
+		f.mu.Unlock()
 		log.Debug(f.Context(), "no changes in llm config")
 
 		return nil
 	}
+	oldLLMs := f.ownedLLMsLocked()
+	running := f.running
+	f.mu.Unlock()
 
-	// Reload the LLMs.
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.SetConfig(newConfig)
-
-	// Close the old LLMs.
-	for _, llm := range f.llms {
-		_ = llm.Close()
+	newLLMs, newOwnedLLMs, newDefaultLLM := f.makeLLMs(newConfig)
+	if running {
+		started := make([]*ownedLLM, 0, len(newOwnedLLMs))
+		for _, llm := range newOwnedLLMs {
+			started = append(started, llm)
+			if err := component.RunUntilReady(f.Context(), llm, 10*time.Second); err != nil {
+				return stderrors.Join(
+					errors.Wrapf(err, "run replacement LLM %s", llm.Name()),
+					errors.Wrap(lifecycle.CloseAll(started...), "close replacement LLMs"),
+				)
+			}
+		}
+		for _, llm := range started {
+			select {
+			case <-llm.owner.Done():
+				return stderrors.Join(
+					errors.Wrapf(llm.owner.UnexpectedExit(), "replacement LLM %s exited", llm.Name()),
+					errors.Wrap(lifecycle.CloseAll(started...), "close replacement LLMs"),
+				)
+			default:
+			}
+		}
 	}
 
-	// Recreate the LLMs.
-	f.initLLMs()
+	// Publish the replacement generation before retiring the old generation so
+	// delayed old-generation exit notifications are ignored.
+	f.mu.Lock()
+	f.SetConfig(newConfig)
+	f.llms = newLLMs
+	f.ownedLLMs = newOwnedLLMs
+	f.defaultLLM = newDefaultLLM
+	f.mu.Unlock()
+	if running {
+		for _, llm := range newOwnedLLMs {
+			llm.watch(f.Context(), f.childExits)
+		}
+	}
 
-	return nil
+	return errors.Wrap(lifecycle.CloseAll(oldLLMs...), "close old LLMs")
 }
 
 func (f *factory) Get(name string) LLM {
@@ -343,9 +522,13 @@ func (f *factory) new(c *Config) LLM {
 }
 
 func (f *factory) initLLMs() {
+	f.llms, f.ownedLLMs, f.defaultLLM = f.makeLLMs(f.Config())
+}
+
+func (f *factory) makeLLMs(config *FactoryConfig) (map[string]LLM, map[string]*ownedLLM, LLM) {
 	var (
-		config     = f.Config()
 		llms       = make(map[string]LLM, len(config.LLMs))
+		ownedLLMs  = make(map[string]*ownedLLM, len(config.LLMs))
 		defaultLLM LLM
 	)
 
@@ -353,14 +536,14 @@ func (f *factory) initLLMs() {
 		llm := f.new(&llmC)
 
 		llms[llmC.Name] = llm
+		ownedLLMs[llmC.Name] = newOwnedLLM(llm)
 
 		if llmC.Name == config.defaultLLM {
 			defaultLLM = llm
 		}
 	}
 
-	f.llms = llms
-	f.defaultLLM = defaultLLM
+	return llms, ownedLLMs, defaultLLM
 }
 
 type mockFactory struct {

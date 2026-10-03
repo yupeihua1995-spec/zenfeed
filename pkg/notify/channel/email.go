@@ -16,9 +16,13 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
+	"net/mail"
+	"net/smtp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -101,15 +105,19 @@ func newEmail(c *Email, dependencies Dependencies) (sender, error) {
 	return &email{
 		config:       c,
 		dependencies: dependencies,
-		dialer:       gomail.NewDialer(host, port, c.From, c.Password),
+		host:         host,
+		port:         port,
 	}, nil
 }
 
 type email struct {
 	config       *Email
 	dependencies Dependencies
-	dialer       *gomail.Dialer
+	host         string
+	port         int
 }
+
+const sendTimeout = 30 * time.Second
 
 func (e *email) Send(ctx context.Context, receiver Receiver, group *route.FeedGroup) error {
 	email, err := e.buildEmail(receiver, group)
@@ -117,11 +125,152 @@ func (e *email) Send(ctx context.Context, receiver Receiver, group *route.FeedGr
 		return errors.Wrap(err, "build email")
 	}
 
-	if err := e.dialer.DialAndSend(email); err != nil {
+	if err := e.send(ctx, receiver.Email, email); err != nil {
 		return errors.Wrap(err, "send email")
 	}
 
 	return nil
+}
+
+func (e *email) send(ctx context.Context, to string, message *gomail.Message) error {
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+
+	rawConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(e.host, strconv.Itoa(e.port)))
+	if err != nil {
+		return preferContextError(ctx, err)
+	}
+	defer func() { _ = rawConn.Close() }()
+
+	deadline, _ := ctx.Deadline()
+	if err := rawConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawConn.SetDeadline(time.Now())
+		case <-watchDone:
+		}
+	}()
+
+	var conn net.Conn = rawConn
+	if e.port == 465 {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: e.host, MinVersion: tls.VersionTLS12})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return preferContextError(ctx, err)
+		}
+		conn = tlsConn
+	}
+
+	client, err := smtp.NewClient(conn, e.host)
+	if err != nil {
+		return preferContextError(ctx, err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if e.port != 465 {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(&tls.Config{ServerName: e.host, MinVersion: tls.VersionTLS12}); err != nil {
+				return preferContextError(ctx, err)
+			}
+		}
+	}
+	if err := e.authenticate(client); err != nil {
+		return preferContextError(ctx, err)
+	}
+
+	fromAddress, err := mail.ParseAddress(e.config.From)
+	if err != nil {
+		return err
+	}
+	toAddress, err := mail.ParseAddress(to)
+	if err != nil {
+		return err
+	}
+	if err := client.Mail(fromAddress.Address); err != nil {
+		return preferContextError(ctx, err)
+	}
+	if err := client.Rcpt(toAddress.Address); err != nil {
+		return preferContextError(ctx, err)
+	}
+	writer, err := client.Data()
+	if err != nil {
+		return preferContextError(ctx, err)
+	}
+	if _, err := message.WriteTo(writer); err != nil {
+		_ = writer.Close()
+
+		return preferContextError(ctx, err)
+	}
+
+	return preferContextError(ctx, writer.Close())
+}
+
+func preferContextError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+
+	return err
+}
+
+func (e *email) authenticate(client *smtp.Client) error {
+	if e.config.From == "" {
+		return nil
+	}
+	ok, mechanisms := client.Extension("AUTH")
+	if !ok {
+		return nil
+	}
+
+	var auth smtp.Auth
+	switch {
+	case strings.Contains(mechanisms, "CRAM-MD5"):
+		auth = smtp.CRAMMD5Auth(e.config.From, e.config.Password)
+	case strings.Contains(mechanisms, "LOGIN") && !strings.Contains(mechanisms, "PLAIN"):
+		auth = &loginAuth{username: e.config.From, password: e.config.Password, host: e.host}
+	default:
+		auth = smtp.PlainAuth("", e.config.From, e.config.Password, e.host)
+	}
+
+	return client.Auth(auth)
+}
+
+type loginAuth struct {
+	username string
+	password string
+	host     string
+}
+
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS {
+		return "", nil, errors.New("unencrypted connection")
+	}
+	if server.Name != a.host {
+		return "", nil, errors.New("wrong host name")
+	}
+
+	return "LOGIN", nil, nil
+}
+
+func (a *loginAuth) Next(challenge []byte, more bool) ([]byte, error) {
+	if !more {
+		return nil, nil
+	}
+	switch {
+	case bytes.Equal(challenge, []byte("Username:")):
+		return []byte(a.username), nil
+	case bytes.Equal(challenge, []byte("Password:")):
+		return []byte(a.password), nil
+	default:
+		return nil, fmt.Errorf("unexpected server challenge: %s", challenge)
+	}
 }
 
 func (e *email) buildEmail(receiver Receiver, group *route.FeedGroup) (*gomail.Message, error) {

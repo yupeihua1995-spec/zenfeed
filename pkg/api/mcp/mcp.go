@@ -19,8 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
+	"mime"
 	"net"
+	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -51,14 +56,37 @@ type Server interface {
 }
 
 type Config struct {
-	Address string
-	host    string
-	port    int
+	Address        string
+	AllowedOrigins []string
+	host           string
+	port           int
 }
+
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	idleTimeout       = 2 * time.Minute
+	shutdownTimeout   = 10 * time.Second
+	maxHeaderBytes    = 1 << 20
+	maxMessageBytes   = 1 << 20
+)
+
+var defaultAllowedOrigins = []string{"http://localhost:1400", "http://127.0.0.1:1400"}
 
 func (c *Config) Validate() error {
 	if c.Address == "" {
-		c.Address = ":1301"
+		c.Address = "127.0.0.1:1301"
+	}
+	if c.AllowedOrigins == nil {
+		c.AllowedOrigins = append([]string(nil), defaultAllowedOrigins...)
+	}
+	for _, origin := range c.AllowedOrigins {
+		parsed, err := url.Parse(origin)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" ||
+			parsed.Fragment != "" || strings.Contains(origin, "*") {
+			return errors.Errorf("invalid allowed origin %q", origin)
+		}
 	}
 	host, portStr, err := net.SplitHostPort(c.Address)
 	if err != nil {
@@ -76,6 +104,12 @@ func (c *Config) Validate() error {
 
 func (c *Config) From(app *config.App) *Config {
 	c.Address = app.API.MCP.Address
+	if app.API.HTTP.AllowedOrigins == nil {
+		c.AllowedOrigins = nil
+	} else {
+		c.AllowedOrigins = make([]string, len(*app.API.HTTP.AllowedOrigins))
+		copy(c.AllowedOrigins, *app.API.HTTP.AllowedOrigins)
+	}
 
 	return c
 }
@@ -121,10 +155,23 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 	h := mcpserver.NewMCPServer(model.AppName, "1.0.0")
 	registerTools(h, s)
 
+	httpServer := &http.Server{
+		Addr:              config.Address,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+		BaseContext: func(net.Listener) context.Context {
+			return s.Context()
+		},
+	}
 	s.mcp = mcpserver.NewSSEServer(
 		h,
 		mcpserver.WithBaseURL(fmt.Sprintf("http://%s:%d", config.host, config.port)),
+		mcpserver.WithHTTPServer(httpServer),
 	)
+	httpServer.Handler = s.secureHTTP(s.mcp)
+	s.http = httpServer
 
 	return s, nil
 }
@@ -159,19 +206,23 @@ func registerConfigTools(h *mcpserver.MCPServer, s *server) {
 	), mcpserver.ToolHandlerFunc(s.queryAppConfigSchema))
 
 	h.AddTool(mcp.NewTool("query_app_config",
-		mcp.WithDescription("Query the current app config (YAML format)."),
+		mcp.WithDescription("Query the current app config in YAML. Secrets are replaced with <redacted>. "+
+			"The opaque top-level _revision must be copied unchanged into apply_app_config."),
 	), mcpserver.ToolHandlerFunc(s.queryAppConfig))
 
 	h.AddTool(mcp.NewTool("apply_app_config",
 		mcp.WithDescription("Apply the new app config (full update). Before applying, "+
-			"you should query the app config schema and current app config first. "+
+			"you must query the app config schema and current app config first. "+
+			"Copy the opaque top-level _revision back unchanged. Missing revisions fail; "+
+			"after a conflict, query again and request confirmation for the rebuilt YAML. "+
 			"And request the user confirm the diff between the new and current app config. "+
 			"When you are writing the config, you should follow the principle of using "+
 			"default values as much as possible, "+
 			"and provide the simplest configuration."),
 		mcp.WithString("yaml",
 			mcp.Required(),
-			mcp.Description("The new app config in YAML format. Validated by app config json schema."),
+			mcp.Description("The complete new app config in YAML, including the mandatory unchanged top-level "+
+				"_revision from query_app_config. Keep <redacted> placeholders unchanged to preserve secrets."),
 		),
 	), mcpserver.ToolHandlerFunc(s.applyAppConfig))
 }
@@ -206,16 +257,132 @@ func registerRSSHubTools(h *mcpserver.MCPServer, s *server) {
 // --- Implementation code block ---
 type server struct {
 	*component.Base[Config, Dependencies]
-	mcp *mcpserver.SSEServer
+	mcp             *mcpserver.SSEServer
+	http            *http.Server
+	listen          func(network, address string) (net.Listener, error)
+	shutdownTimeout time.Duration
+}
+
+func (s *server) secureHTTP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allowedOrigin := origin != "" && slices.Contains(s.Config().AllowedOrigins, origin)
+		if origin != "" && !allowedOrigin {
+			w.Header().Add("Vary", "Origin")
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+
+			return
+		}
+
+		allowedMethods := ""
+		switch r.URL.Path {
+		case s.mcp.CompleteSsePath():
+			allowedMethods = "GET, OPTIONS"
+		case s.mcp.CompleteMessagePath():
+			allowedMethods = "POST, OPTIONS"
+		}
+		if allowedMethods != "" {
+			w.Header().Set("Allow", allowedMethods)
+		}
+		if origin != "" {
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", allowedMethods)
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
+		}
+		if r.Method == http.MethodOptions && allowedMethods != "" {
+			w.WriteHeader(http.StatusNoContent)
+
+			return
+		}
+		if r.URL.Path == s.mcp.CompleteSsePath() && r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+			return
+		}
+		if r.URL.Path == s.mcp.CompleteMessagePath() {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+				return
+			}
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/json" {
+				http.Error(w, "request body must use application/json", http.StatusUnsupportedMediaType)
+
+				return
+			}
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxMessageBytes))
+			if err != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+
+					return
+				}
+				http.Error(w, "read request body", http.StatusBadRequest)
+
+				return
+			}
+			r.Body = io.NopCloser(strings.NewReader(string(body)))
+			r.ContentLength = int64(len(body))
+		}
+
+		next.ServeHTTP(&originResponseWriter{ResponseWriter: w, origin: origin}, r)
+	})
+}
+
+type originResponseWriter struct {
+	http.ResponseWriter
+	origin   string
+	prepared bool
+}
+
+func (w *originResponseWriter) prepare() {
+	if w.prepared {
+		return
+	}
+	w.prepared = true
+	w.Header().Del("Access-Control-Allow-Origin")
+	if w.origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", w.origin)
+	}
+}
+
+func (w *originResponseWriter) WriteHeader(statusCode int) {
+	w.prepare()
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *originResponseWriter) Write(data []byte) (int, error) {
+	w.prepare()
+
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *originResponseWriter) Flush() {
+	w.prepare()
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func (s *server) Run() (err error) {
 	ctx := telemetry.StartWith(s.Context(), append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "Run")...)
 	defer func() { telemetry.End(ctx, err) }()
 
+	listen := s.listen
+	if listen == nil {
+		listen = net.Listen
+	}
+	listener, err := listen("tcp", s.http.Addr)
+	if err != nil {
+		return errors.Wrap(err, "listen")
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
-		serverErr <- s.mcp.Start(s.Config().Address)
+		serverErr <- s.http.Serve(listener)
 	}()
 
 	s.MarkReady()
@@ -223,8 +390,30 @@ func (s *server) Run() (err error) {
 	case <-ctx.Done():
 		log.Info(ctx, "shutting down")
 
-		return s.mcp.Shutdown(ctx)
+		shutdownAfter := s.shutdownTimeout
+		if shutdownAfter <= 0 {
+			shutdownAfter = shutdownTimeout
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownAfter)
+		defer cancel()
+
+		// Do not call SSEServer.Shutdown here. In mcp-go v0.17 it closes
+		// session.done while the request handler also closes it when its context
+		// is canceled, which can panic. Shutting down our owned HTTP server
+		// cancels request contexts and lets each handler clean up its own session.
+		if err := s.http.Shutdown(shutdownCtx); err != nil {
+			if closeErr := s.http.Close(); closeErr != nil {
+				return errors.Wrapf(err, "shutdown MCP server; force close: %v", closeErr)
+			}
+
+			return errors.Wrap(err, "shutdown MCP server; connections force-closed")
+		}
+
+		return nil
 	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return errors.Wrap(err, "listen and serve")
 	}
 }
@@ -272,14 +461,17 @@ func (s *server) queryAppConfig(ctx context.Context, req mcp.CallToolRequest) (*
 
 func (s *server) applyAppConfig(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Parse arguments.
-	yamlStr := req.Params.Arguments["yaml"].(string)
-	config := &config.App{}
-	if err := yaml.Unmarshal([]byte(yamlStr), config); err != nil {
+	yamlStr, ok := req.Params.Arguments["yaml"].(string)
+	if !ok || strings.TrimSpace(yamlStr) == "" {
+		return s.error(errors.New("yaml is required")), nil
+	}
+	applyRequest := &api.ApplyAppConfigRequest{}
+	if err := yaml.Unmarshal([]byte(yamlStr), applyRequest); err != nil {
 		return s.error(errors.Wrap(err, "invalid yaml")), nil
 	}
 
 	// Forward request to API.
-	_, err := s.Dependencies().API.ApplyAppConfig(ctx, &api.ApplyAppConfigRequest{App: *config})
+	_, err := s.Dependencies().API.ApplyAppConfig(ctx, applyRequest)
 	if err != nil {
 		return s.error(errors.Wrap(err, "apply api")), nil
 	}
@@ -320,7 +512,10 @@ func (s *server) queryRSSHubWebsites(ctx context.Context, req mcp.CallToolReques
 
 func (s *server) queryRSSHubRoutes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Parse arguments.
-	websiteID := req.Params.Arguments["website_id"].(string)
+	websiteID, ok := req.Params.Arguments["website_id"].(string)
+	if !ok || strings.TrimSpace(websiteID) == "" {
+		return s.error(errors.New("website_id is required")), nil
+	}
 
 	// Forward request to API.
 	apiResp, err := s.Dependencies().API.QueryRSSHubRoutes(ctx, &api.QueryRSSHubRoutesRequest{WebsiteID: websiteID})

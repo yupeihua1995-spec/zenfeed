@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"time"
 
 	"github.com/pkg/errors"
 	oai "github.com/sashabaranov/go-openai"
@@ -41,9 +42,16 @@ type gemini struct {
 	embeddingSpliter embeddingSpliter
 }
 
+const (
+	geminiHTTPTimeout     = 2 * time.Minute
+	maxGeminiResponseBody = 64 << 20
+	maxGeminiErrorBody    = 64 << 10
+)
+
 func newGemini(c *Config) LLM {
 	config := oai.DefaultConfig(c.APIKey)
 	config.BaseURL = filepath.Join(c.Endpoint, "openai") // OpenAI compatible endpoint.
+	config.HTTPClient = &http.Client{Timeout: geminiHTTPTimeout}
 	client := oai.NewClientWithConfig(config)
 	embeddingSpliter := newEmbeddingSpliter(1536, 64)
 
@@ -59,7 +67,7 @@ func newGemini(c *Config) LLM {
 			Base:   base,
 			client: client,
 		},
-		hc:               &http.Client{},
+		hc:               &http.Client{Timeout: geminiHTTPTimeout},
 		embeddingSpliter: embeddingSpliter,
 	}
 }
@@ -107,16 +115,24 @@ func (g *gemini) doWAVRequest(ctx context.Context, reqPayload *geminiRequest) ([
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		errMsg, _ := io.ReadAll(resp.Body)
+		errMsg, _ := io.ReadAll(io.LimitReader(resp.Body, maxGeminiErrorBody))
 
 		return nil, errors.Errorf("tts request failed with status %d: %s", resp.StatusCode, string(errMsg))
 	}
 
 	var ttsResp geminiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ttsResp); err != nil {
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxGeminiResponseBody+1))
+	if err != nil {
+		return nil, errors.Wrap(err, "read tts response")
+	}
+	if len(responseBody) > maxGeminiResponseBody {
+		return nil, errors.Errorf("tts response exceeds %d bytes", maxGeminiResponseBody)
+	}
+	if err := json.Unmarshal(responseBody, &ttsResp); err != nil {
 		return nil, errors.Wrap(err, "decode tts response")
 	}
-	if len(ttsResp.Candidates) == 0 || len(ttsResp.Candidates[0].Content.Parts) == 0 || ttsResp.Candidates[0].Content.Parts[0].InlineData == nil {
+	if len(ttsResp.Candidates) == 0 || ttsResp.Candidates[0].Content == nil ||
+		len(ttsResp.Candidates[0].Content.Parts) == 0 || ttsResp.Candidates[0].Content.Parts[0].InlineData == nil {
 		return nil, errors.New("no audio data in tts response")
 	}
 

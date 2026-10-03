@@ -162,7 +162,7 @@ $env:API_KEY = "sk-..."; docker-compose -p zenfeed up -d
 访问 http://localhost:1400
 
 > [!WARNING]
-> *   如果将 zenfeed 部署在 VPS 等公网环境，请通过 `http://<你的IP>:1400` 访问，并确保防火墙/安全组已放行 `1400` 端口。
+> *   如果将 zenfeed 部署在 VPS 等公网环境，请勿直接暴露 `1400`、`1300`、`1301` 或 `9090` 端口。请通过带身份认证与 TLS 的反向代理访问 Web UI；默认 Compose 仅将 Web UI 和 HTTP API 绑定到宿主机 loopback。
 > *   **安全提示：** zenfeed 尚无认证机制，将服务暴露到公网可能会泄露您的 `API_KEY`。请务必配置严格的安全组规则，仅对信任的 IP 开放访问。
 
 ### 3. 开始使用

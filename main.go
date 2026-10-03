@@ -178,6 +178,9 @@ func (a *App) setup() error {
 	if err := a.setupFeedStorage(); err != nil {
 		return errors.Wrap(err, "setup feed storage")
 	}
+	if err := a.setupScraper(); err != nil {
+		return errors.Wrap(err, "setup scraper")
+	}
 	if err := a.setupAPI(); err != nil {
 		return errors.Wrap(err, "setup api")
 	}
@@ -189,9 +192,6 @@ func (a *App) setup() error {
 	}
 	if err := a.setupRSSServer(); err != nil {
 		return errors.Wrap(err, "setup rss server")
-	}
-	if err := a.setupScraper(); err != nil {
-		return errors.Wrap(err, "setup scraper")
 	}
 	if err := a.setupScheduler(); err != nil {
 		return errors.Wrap(err, "setup scheduler")
@@ -306,6 +306,7 @@ func (a *App) setupTelemetryServer() (err error) {
 	if err != nil {
 		return err
 	}
+	a.configMgr.Subscribe(a.telemetry)
 
 	return nil
 }
@@ -316,6 +317,7 @@ func (a *App) setupAPI() (err error) {
 		ConfigManager: a.configMgr,
 		FeedStorage:   a.feedStorage,
 		LLMFactory:    a.llmFactory,
+		SourceManager: a.scraperMgr,
 	})
 	if err != nil {
 		return err
@@ -421,17 +423,19 @@ func (a *App) setupNotifier() (err error) {
 
 // run starts the application components and blocks until shutdown.
 func (a *App) run(ctx context.Context) error {
-	defer close(a.notifyChan) // Close channel when Run finishes.
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
-		sig := <-sigCh
-		log.Info(ctx, "received signal, shutting down", "signal", sig.String())
-		cancel()
+		select {
+		case sig := <-sigCh:
+			log.Info(ctx, "received signal, shutting down", "signal", sig.String())
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	log.Info(ctx, "starting application components...")

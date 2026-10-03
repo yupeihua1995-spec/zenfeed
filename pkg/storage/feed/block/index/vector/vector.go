@@ -225,6 +225,9 @@ func (idx *idx) Search(
 	if example := idx.layers[0].randomEntry(); example != nil && example.dimension() != len(q) {
 		return nil, errors.New("vector dimension mismatch")
 	}
+	if err := validateVector(q); err != nil {
+		return nil, err
+	}
 
 	// Find first entry node.
 	var (
@@ -281,11 +284,11 @@ func (idx *idx) Add(ctx context.Context, id uint64, vectors [][]float32) (err er
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	if err := idx.validate(vectors); err != nil {
+		return err
+	}
 	if _, exists := idx.m[id]; exists {
 		return nil // Update is not supported.
-	}
-	if example := idx.layers[0].randomEntry(); example != nil && example.dimension() != len(vectors[0]) {
-		return errors.New("vector dimension mismatch")
 	}
 
 	insertLevel, maxLevel := idx.randomInsertLevel()
@@ -312,8 +315,66 @@ func (idx *idx) Add(ctx context.Context, id uint64, vectors [][]float32) (err er
 
 		entry, err = idx.insertAndLinkAtLevel(ctx, level, newNode, entry, vectors, shouldInsert)
 		if err != nil {
+			idx.removeNode(newNode)
+
 			return errors.Wrap(err, "insert and link at level")
 		}
+	}
+
+	return nil
+}
+
+func (idx *idx) removeNode(target *node) {
+	delete(idx.m, target.id)
+	for _, layer := range idx.layers {
+		for id := range target.friendsOnLayers[layer.level] {
+			if friend := idx.m[id]; friend != nil && layer.level < len(friend.friendsOnLayers) {
+				delete(friend.friendsOnLayers[layer.level], target.id)
+			}
+		}
+		for i, id := range layer.nodes {
+			if id == target.id {
+				layer.nodes = append(layer.nodes[:i], layer.nodes[i+1:]...)
+
+				break
+			}
+		}
+	}
+}
+
+func (idx *idx) validate(vectors [][]float32) error {
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		return errors.New("vectors are required")
+	}
+
+	dimension := len(vectors[0])
+	for _, v := range vectors[1:] {
+		if len(v) != dimension {
+			return errors.New("vector dimension mismatch")
+		}
+	}
+	if example := idx.layers[0].randomEntry(); example != nil && example.dimension() != dimension {
+		return errors.New("vector dimension mismatch")
+	}
+	for _, v := range vectors {
+		if err := validateVector(v); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateVector(vector []float32) error {
+	var normSquared float32
+	for _, value := range vector {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return errors.New("vector components must be finite")
+		}
+		normSquared += value * value
+	}
+	if normSquared == 0 || math.IsNaN(float64(normSquared)) || math.IsInf(float64(normSquared), 0) {
+		return errors.New("vector norm must be finite and non-zero")
 	}
 
 	return nil

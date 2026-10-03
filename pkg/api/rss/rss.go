@@ -16,6 +16,7 @@
 package rss
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"text/template"
@@ -49,9 +50,18 @@ type Config struct {
 	contentHTMLTemplate *template.Template
 }
 
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 2 * time.Minute
+	idleTimeout       = 2 * time.Minute
+	shutdownTimeout   = 10 * time.Second
+	maxHeaderBytes    = 1 << 20
+)
+
 func (c *Config) Validate() error {
 	if c.Address == "" {
-		c.Address = ":1302"
+		c.Address = "127.0.0.1:1302"
 	}
 	if _, _, err := net.SplitHostPort(c.Address); err != nil {
 		return errors.Wrap(err, "invalid address")
@@ -117,7 +127,15 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 	router := http.NewServeMux()
 	router.Handle("/", http.HandlerFunc(s.rss))
 
-	s.http = &http.Server{Addr: config.Address, Handler: router}
+	s.http = &http.Server{
+		Addr:              config.Address,
+		Handler:           router,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 
 	return s, nil
 }
@@ -132,9 +150,14 @@ func (s *server) Run() (err error) {
 	ctx := telemetry.StartWith(s.Context(), append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "Run")...)
 	defer func() { telemetry.End(ctx, err) }()
 
+	listener, err := net.Listen("tcp", s.http.Addr)
+	if err != nil {
+		return errors.Wrap(err, "listen")
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
-		serverErr <- s.http.ListenAndServe()
+		serverErr <- s.http.Serve(listener)
 	}()
 
 	s.MarkReady()
@@ -142,10 +165,27 @@ func (s *server) Run() (err error) {
 	case <-ctx.Done():
 		log.Info(ctx, "shutting down")
 
-		return s.http.Shutdown(ctx)
+		return shutdownHTTPServer(s.http)
 	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return errors.Wrap(err, "listen and serve")
 	}
+}
+
+func shutdownHTTPServer(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		if closeErr := server.Close(); closeErr != nil {
+			return errors.Wrapf(err, "shutdown server; force close: %v", closeErr)
+		}
+
+		return errors.Wrap(err, "shutdown server; connections force-closed")
+	}
+
+	return nil
 }
 
 func (s *server) Reload(app *config.App) error {

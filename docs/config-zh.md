@@ -14,7 +14,7 @@
 
 | 字段                  | 类型     | 描述                                                                           | 默认值       | 是否必需 |
 | :-------------------- | :------- | :----------------------------------------------------------------------------- | :----------- | :------- |
-| `telemetry.address`   | `string` | 暴露 Prometheus 指标 & pprof。                                                 | `:9090`      | 否       |
+| `telemetry.address`   | `string` | 暴露 Prometheus 指标与 pprof；仅应在可信网络控制后显式监听 `0.0.0.0:9090`。 | `127.0.0.1:9090` | 否 |
 | `telemetry.log`       | `object` | Telemetry 相关的日志配置。                                                     | (见具体字段) | 否       |
 | `telemetry.log.level` | `string` | Telemetry 相关消息的日志级别, 可选值为 `debug`, `info`, `warn`, `error` 之一。 | `info`       | 否       |
 
@@ -23,9 +23,12 @@
 | 字段               | 类型     | 描述                                                                                      | 默认值                  | 是否必需              |
 | :----------------- | :------- | :---------------------------------------------------------------------------------------- | :---------------------- | :-------------------- |
 | `api.http`         | `object` | HTTP API 配置。                                                                           | (见具体字段)            | 否                    |
-| `api.http.address` | `string` | HTTP API 的地址 (`[host]:port`)。例如 `0.0.0.0:1300`。应用运行后不可更改。                | `:1300`                 | 否                    |
+| `api.http.address` | `string` | HTTP API 的地址 (`[host]:port`)。例如 `0.0.0.0:1300`。应用运行后不可更改。                | `127.0.0.1:1300`        | 否                    |
+| `api.http.allowed_origins` | `字符串列表` | 允许调用 API 的精确浏览器 Origin；不支持通配符，显式空列表会禁用跨域访问。如需通过托管 Demo 直连 API，须显式添加 `https://zenfeed-web.pages.dev`。 | `http://localhost:1400`、`http://127.0.0.1:1400` | 否 |
 | `api.mcp`          | `object` | MCP API 配置。                                                                            | (见具体字段)            | 否                    |
-| `api.mcp.address`  | `string` | MCP API 的地址 (`[host]:port`)。例如 `0.0.0.0:1301`。应用运行后不可更改。                 | `:1301`                 | 否                    |
+| `api.mcp.address`  | `string` | MCP API 的地址 (`[host]:port`)。例如 `0.0.0.0:1301`。应用运行后不可更改。                 | `127.0.0.1:1301`        | 否                    |
+| `api.rss`          | `object` | RSS API 配置。                                                                            | (见具体字段)            | 否                    |
+| `api.rss.address`  | `string` | RSS API 的地址 (`[host]:port`)。例如 `0.0.0.0:1302`。应用运行后不可更改。                 | `127.0.0.1:1302`        | 否                    |
 | `api.llm`          | `string` | 用于总结 Feed 的 LLM 名称。例如 `my-favorite-gemini-king`。引用在 `llms` 部分定义的 LLM。 | `llms` 部分中的默认 LLM | 是 (如果使用总结功能) |
 
 ### LLM 配置 (`llms[]`)
@@ -224,3 +227,9 @@
 | `...email.password`                   | `string` | 发件人 Email 的应用专用密码。(对于 Gmail, 参见 [Google 应用密码](https://support.google.com/mail/answer/185833))。                                      |                  | 是       |
 | `...email.feed_markdown_template`     | `string` | 用于在 Email 正文中格式化每个 Feed 的 Markdown 模板。默认渲染 Feed 内容。不能与 `feed_html_snippet_template` 同时设置。可用的模板变量取决于 Feed 标签。 | `{{ .content }}` | 否       |
 | `...email.feed_html_snippet_template` | `string` | 用于格式化每个 Feed 的 HTML 片段模板。不能与 `feed_markdown_template` 同时设置。可用的模板变量取决于 Feed 标签。                                        |                  | 否       |
+
+### 配置乐观并发控制
+
+`POST /query_config` 会在顶层返回一个不透明的 `_revision` 值。客户端必须在下一次 `POST /apply_config` 请求中原样携带该值。缺少 revision 时返回 HTTP `428`；revision 已过期时返回 HTTP `409`，避免覆盖同一 Zenfeed 进程内较新的 API 更新。revision 检查只串行化当前进程处理的 API 更新：文件系统不提供带比较交换语义的 POSIX rename，直接编辑配置文件仍可能与最终 rename 竞态。禁止在 API 更新期间直接编辑配置文件；请先停止 Zenfeed，或以其他方式保证独占访问。
+
+密钥值会以保留占位符 `<redacted>` 返回。若要保留现有 LLM、Jina、RSSHub、对象存储、SMTP 或 webhook 凭据，应原样保留占位符；只有明确轮换密钥时才替换它。由于密钥占位符按名称匹配，LLM 名称和通知接收者名称必须唯一。JSON API 仅接受 `POST`（以及用于探测的 `OPTIONS`），默认不开放宽松跨域访问，并默认只监听 loopback。请求体默认限制为 1 MiB；`/write` 允许 8 MiB，但最多包含 1,000 条 Feed，所有标签内容合计不超过 6 MiB。浏览器部署应使用同源 Web 代理；远程访问必须置于带身份验证的反向代理之后，而不是直接暴露这些管理接口。

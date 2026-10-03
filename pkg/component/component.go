@@ -18,6 +18,7 @@ package component
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -48,11 +49,14 @@ type Component interface {
 	// Run starts the component.
 	// It blocks until the component is closed.
 	// It MUST be called only once.
+	// After Close returns, Run MUST return promptly.
 	Run() (err error)
 	// Ready returns a channel that is closed when the component is ready.
 	// Returns a chan to notify the component is ready when Run is called.
 	Ready() (notify <-chan struct{})
-	// Close closes the component.
+	// Close closes the component and unblocks Run.
+	// It MUST be safe before, during, or after Run, MUST be safe to call more
+	// than once, and SHOULD return promptly.
 	Close() (err error)
 }
 
@@ -67,6 +71,9 @@ type Base[Config any, Dependencies any] struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	ch     chan struct{}
+
+	readyOnce sync.Once
+	closeOnce sync.Once
 }
 
 type BaseConfig[Config any, Dependencies any] struct {
@@ -150,7 +157,9 @@ func (c *Base[Config, Dependencies]) Run() error {
 }
 
 func (c *Base[Config, Dependencies]) MarkReady() {
-	close(c.ch)
+	c.readyOnce.Do(func() {
+		close(c.ch)
+	})
 }
 
 func (c *Base[Config, Dependencies]) Ready() <-chan struct{} {
@@ -158,9 +167,11 @@ func (c *Base[Config, Dependencies]) Ready() <-chan struct{} {
 }
 
 func (c *Base[Config, Dependencies]) Close() error {
-	c.cancel()
-	telemetry.CloseMetrics(c.TelemetryLabelsID())
-	log.Info(c.Context(), "component closed", c.TelemetryLabels()...)
+	c.closeOnce.Do(func() {
+		c.cancel()
+		telemetry.CloseMetrics(c.TelemetryLabelsID())
+		log.Info(c.Context(), "component closed", c.TelemetryLabels()...)
+	})
 
 	return nil
 }
@@ -214,103 +225,424 @@ func (m MockOptions) Apply(mock *Mock) {
 }
 
 func RunUntilReady(waitCtx context.Context, component Component, timeout time.Duration) error {
-	errCh := make(chan error, 1)
+	if err := waitCtx.Err(); err != nil {
+		return err
+	}
+
+	runResultCh := make(chan error, 1)
 	go func() {
-		errCh <- component.Run()
+		runResultCh <- component.Run()
 	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	select {
 	case <-component.Ready():
+		// Prefer an already completed Run over readiness. A component that exits
+		// before this helper returns is not usable even if it briefly signaled ready.
+		select {
+		case runErr := <-runResultCh:
+			return stopExitedComponent(component, runBeforeReadyError(component, runErr), timeout)
+		default:
+		}
+
 		log.Info(waitCtx, "component run and ready",
 			telemetrymodel.KeyComponent, component.Name(),
 			telemetrymodel.KeyComponentInstance, component.Instance(),
 		)
 
 		return nil
-	case err := <-errCh:
-		return err
-	case <-time.After(timeout):
-		return errors.New("component not ready after timeout")
+	case runErr := <-runResultCh:
+		return stopExitedComponent(component, runBeforeReadyError(component, runErr), timeout)
+	case <-timer.C:
+		return stopComponentAndWait(
+			component,
+			runResultCh,
+			errors.New("component not ready after timeout"),
+			timeout,
+		)
 	case <-waitCtx.Done():
-		return waitCtx.Err()
+		return stopComponentAndWait(component, runResultCh, waitCtx.Err(), timeout)
 	}
+}
+
+// ErrComponentShutdownTimeout means Close or Run did not finish within the
+// shutdown grace period used by RunUntilReady. The original timeout or context
+// error is joined with this error so callers can still inspect both causes.
+var ErrComponentShutdownTimeout = errors.New("component shutdown timed out")
+
+const defaultComponentShutdownTimeout = 30 * time.Second
+
+func runBeforeReadyError(component Component, runErr error) error {
+	if runErr != nil {
+		return runErr
+	}
+
+	return fmt.Errorf(
+		"component %s/%s exited before becoming ready",
+		component.Name(),
+		component.Instance(),
+	)
+}
+
+func stopExitedComponent(component Component, cause error, timeout time.Duration) error {
+	runResultCh := make(chan error, 1)
+	runResultCh <- nil
+
+	return stopComponentAndWait(component, runResultCh, cause, timeout)
+}
+
+func stopComponentAndWait(
+	component Component,
+	runResultCh <-chan error,
+	cause error,
+	timeout time.Duration,
+) error {
+	closeResultCh := make(chan error, 1)
+	go func() {
+		closeResultCh <- component.Close()
+	}()
+
+	shutdownTimeout := timeout
+	if shutdownTimeout <= 0 || shutdownTimeout > defaultComponentShutdownTimeout {
+		shutdownTimeout = defaultComponentShutdownTimeout
+	}
+	timer := time.NewTimer(shutdownTimeout)
+	defer timer.Stop()
+
+	var runErr, closeErr error
+	runWait := runResultCh
+	closeWait := (<-chan error)(closeResultCh)
+waitForShutdown:
+	for runWait != nil || closeWait != nil {
+		select {
+		case runErr = <-runWait:
+			runWait = nil
+		case closeErr = <-closeWait:
+			closeWait = nil
+		case <-timer.C:
+			// A result may become available at the deadline. Drain both channels
+			// before deciding which operations are still outstanding.
+			if runWait != nil {
+				select {
+				case runErr = <-runWait:
+					runWait = nil
+				default:
+				}
+			}
+			if closeWait != nil {
+				select {
+				case closeErr = <-closeWait:
+					closeWait = nil
+				default:
+				}
+			}
+			if runWait == nil && closeWait == nil {
+				break waitForShutdown
+			}
+
+			pending := "Run"
+			if runWait == nil {
+				pending = "Close"
+			} else if closeWait != nil {
+				pending = "Close and Run"
+			}
+
+			return errors.Join(
+				cause,
+				closeError(closeErr),
+				runShutdownError(runErr),
+				fmt.Errorf(
+					"%w after %s waiting for component %s/%s %s",
+					ErrComponentShutdownTimeout,
+					shutdownTimeout,
+					component.Name(),
+					component.Instance(),
+					pending,
+				),
+			)
+		}
+	}
+
+	var shutdownErrors []error
+	shutdownErrors = append(shutdownErrors, cause)
+	if closeErr != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("close component: %w", closeErr))
+	}
+	if runErr != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("component exited while shutting down: %w", runErr))
+	}
+	if len(shutdownErrors) == 1 {
+		return cause
+	}
+
+	return errors.Join(shutdownErrors...)
+}
+
+func closeError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("close component: %w", err)
+}
+
+func runShutdownError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("component exited while shutting down: %w", err)
 }
 
 type Group []Component
 
+type componentRunResult struct {
+	component Component
+	name      string
+	instance  string
+	err       error
+}
+
+type preparedComponent struct {
+	component Component
+	name      string
+	instance  string
+	ready     <-chan struct{}
+}
+
+type startCoordinator struct {
+	mu             sync.Mutex
+	stopping       bool
+	firstResult    *componentRunResult
+	firstPublished chan struct{}
+	runResultCh    chan componentRunResult
+}
+
+func newStartCoordinator(resultBuffer int) *startCoordinator {
+	return &startCoordinator{
+		firstPublished: make(chan struct{}),
+		runResultCh:    make(chan componentRunResult, resultBuffer),
+	}
+}
+
+func (c *startCoordinator) authorizeGroup() (componentRunResult, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopping || c.firstResult != nil {
+		if c.firstResult != nil {
+			return *c.firstResult, false
+		}
+
+		return componentRunResult{}, false
+	}
+
+	return componentRunResult{}, true
+}
+
+func (c *startCoordinator) publish(result componentRunResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if result.err == nil && !c.stopping {
+		result.err = fmt.Errorf(
+			"component %s/%s exited unexpectedly",
+			result.name,
+			result.instance,
+		)
+	}
+	if c.firstResult == nil {
+		first := result
+		c.firstResult = &first
+		close(c.firstPublished)
+	}
+	c.runResultCh <- result
+}
+
+func (c *startCoordinator) beginStopping() {
+	c.mu.Lock()
+	c.stopping = true
+	c.mu.Unlock()
+}
+
 func Run(ctx context.Context, groups ...Group) error {
+	return runGroups(ctx, newStartCoordinator(componentCount(groups)), groups...)
+}
+
+func runGroups(ctx context.Context, coordinator *startCoordinator, groups ...Group) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Start groups in order.
-	runningErrCh := make(chan error, 1)
-	for i, group := range groups {
-		if err := startGroup(ctx, group, runningErrCh); err != nil {
-			stopGroups(groups, i)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-			return err
+	// Start groups in order.
+	runWGs := make([]sync.WaitGroup, len(groups))
+	for i, group := range groups {
+		if err := ctx.Err(); err != nil {
+			coordinator.beginStopping()
+			closeErr := stopGroupsAndWait(groups, runWGs, i-1)
+			if runErr := firstRunError(coordinator.runResultCh, err, context.Canceled); runErr != nil {
+				return joinErrors(runErr, closeErr)
+			}
+
+			return joinErrors(err, closeErr)
+		}
+		prepared := prepareGroup(ctx, group)
+		if err := ctx.Err(); err != nil {
+			coordinator.beginStopping()
+			closeErr := stopGroupsAndWait(groups, runWGs, i-1)
+			if runErr := firstRunError(coordinator.runResultCh, err, context.Canceled); runErr != nil {
+				return joinErrors(runErr, closeErr)
+			}
+
+			return joinErrors(err, closeErr)
+		}
+		if result, authorized := coordinator.authorizeGroup(); !authorized {
+			coordinator.beginStopping()
+			closeErr := stopGroupsAndWait(groups, runWGs, i-1)
+
+			return joinErrors(componentRunError(result), closeErr)
+		}
+		startComponents(ctx, prepared, coordinator, &runWGs[i])
+		if err := waitForGroupReady(ctx, prepared, coordinator.runResultCh); err != nil {
+			coordinator.beginStopping()
+			closeErr := stopGroupsAndWait(groups, runWGs, i)
+			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				if runErr := firstRunError(coordinator.runResultCh, ctxErr, context.Canceled); runErr != nil {
+					return joinErrors(runErr, closeErr)
+				}
+
+				return joinErrors(err, closeErr)
+			}
+
+			return joinErrors(err, closeErr)
 		}
 	}
 
 	// All groups started successfully, wait for any component to fail or context to be canceled.
 	select {
-	case err := <-runningErrCh:
-		stopGroups(groups, len(groups)-1)
+	case result := <-coordinator.runResultCh:
+		coordinator.beginStopping()
+		runErr := result.err
+		closeErr := stopGroupsAndWait(groups, runWGs, len(groups)-1)
 
-		return err
+		return joinErrors(runErr, closeErr)
 
 	case <-ctx.Done():
-		stopGroups(groups, len(groups)-1)
+		coordinator.beginStopping()
+		closeErr := stopGroupsAndWait(groups, runWGs, len(groups)-1)
+		// All Run goroutines have now published their results. Prefer a concrete
+		// runtime failure over cancellation, but ignore the cancellation itself.
+		runErr := firstRunError(coordinator.runResultCh, ctx.Err(), context.Canceled)
 
-		return nil
+		return joinErrors(runErr, closeErr)
 	}
 }
 
-func startGroup(ctx context.Context, group Group, runningErrCh chan error) error {
+func componentCount(groups []Group) int {
+	count := 0
+	for _, group := range groups {
+		count += len(group)
+	}
+	if count == 0 {
+		return 1
+	}
+
+	return count
+}
+
+func prepareGroup(ctx context.Context, group Group) []preparedComponent {
 	gCtx := log.With(ctx, telemetrymodel.KeyComponent, "group")
 	log.Info(gCtx, "starting group", "components", len(group))
+	prepared := make([]preparedComponent, 0, len(group))
+	for _, component := range group {
+		item := preparedComponent{
+			component: component,
+			name:      component.Name(),
+			instance:  component.Instance(),
+			ready:     component.Ready(),
+		}
+		log.Info(gCtx, "preparing component",
+			telemetrymodel.KeyComponent, item.name,
+			telemetrymodel.KeyComponentInstance, item.instance,
+		)
+		prepared = append(prepared, item)
+	}
 
-	// Start all components in current group concurrently.
-	startComponents(gCtx, group, runningErrCh)
-
-	// Wait for all components to be ready or error.
-	return waitForGroupReady(ctx, group, runningErrCh)
+	return prepared
 }
 
-func startComponents(ctx context.Context, group Group, runningErrCh chan error) {
-	for _, comp := range group {
-		go func(c Component) {
-			log.Info(ctx, "starting component",
-				telemetrymodel.KeyComponent, c.Name(),
-				telemetrymodel.KeyComponentInstance, c.Instance(),
-			)
-			if err := c.Run(); err != nil {
-				select {
-				case runningErrCh <- err:
-				default:
-				}
-			}
+func startComponents(
+	ctx context.Context,
+	group []preparedComponent,
+	coordinator *startCoordinator,
+	runWG *sync.WaitGroup,
+) {
+	for _, item := range group {
+		runWG.Add(1)
+		go func(c preparedComponent) {
+			defer runWG.Done()
+			err := c.component.Run()
+			coordinator.publish(componentRunResult{
+				component: c.component,
+				name:      c.name,
+				instance:  c.instance,
+				err:       err,
+			})
 			log.Info(ctx, "component exited",
-				telemetrymodel.KeyComponent, c.Name(),
-				telemetrymodel.KeyComponentInstance, c.Instance(),
+				telemetrymodel.KeyComponent, c.name,
+				telemetrymodel.KeyComponentInstance, c.instance,
 			)
-		}(comp)
+		}(item)
 	}
 }
 
-func waitForGroupReady(ctx context.Context, group Group, runningErrCh chan error) error {
+func waitForGroupReady(ctx context.Context, group []preparedComponent, runResultCh chan componentRunResult) error {
 	for _, comp := range group {
+		timer := time.NewTimer(30 * time.Second)
 		select {
-		case <-comp.Ready():
+		case <-comp.ready:
+			timer.Stop()
+			select {
+			case result := <-runResultCh:
+				return componentRunError(result)
+			default:
+			}
 			log.Info(ctx, "component run and ready",
-				telemetrymodel.KeyComponent, comp.Name(),
-				telemetrymodel.KeyComponentInstance, comp.Instance(),
+				telemetrymodel.KeyComponent, comp.name,
+				telemetrymodel.KeyComponentInstance, comp.instance,
 			)
-		case err := <-runningErrCh:
-			return err
-		case <-time.After(30 * time.Second):
+		case result := <-runResultCh:
+			timer.Stop()
+			return componentRunError(result)
+		case <-timer.C:
+			select {
+			case result := <-runResultCh:
+				return componentRunError(result)
+			default:
+			}
+			select {
+			case <-comp.ready:
+				continue
+			default:
+			}
+
 			return errors.New("not ready after 30 seconds")
 		case <-ctx.Done():
+			timer.Stop()
+			select {
+			case result := <-runResultCh:
+				return componentRunError(result)
+			default:
+			}
+			select {
+			case <-comp.ready:
+				continue
+			default:
+			}
+
 			return ctx.Err()
 		}
 	}
@@ -318,20 +650,85 @@ func waitForGroupReady(ctx context.Context, group Group, runningErrCh chan error
 	return nil
 }
 
-func stopGroups(groups []Group, runAt int) {
-	for i := runAt; i >= 0; i-- {
-		stopGroup(groups[i])
+func componentRunError(result componentRunResult) error {
+	return result.err
+}
+
+func firstRunError(runResultCh <-chan componentRunResult, ignored ...error) error {
+	for {
+		select {
+		case result := <-runResultCh:
+			if result.err != nil && !matchesAnyError(result.err, ignored) {
+				return result.err
+			}
+		default:
+			return nil
+		}
 	}
 }
 
-func stopGroup(group Group) {
+func matchesAnyError(err error, targets []error) bool {
+	for _, target := range targets {
+		if target != nil && errors.Is(err, target) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func joinErrors(errs ...error) error {
+	joined := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			joined = append(joined, err)
+		}
+	}
+
+	switch len(joined) {
+	case 0:
+		return nil
+	case 1:
+		return joined[0]
+	default:
+		return errors.Join(joined...)
+	}
+}
+
+// stopGroupsAndWait shuts groups down in reverse dependency order. Each group
+// is fully closed and joined before the next group is touched. The waits are
+// intentionally unbounded: Run must never return while a started Component.Run
+// goroutine is still alive, so Component.Close must promptly unblock Run.
+func stopGroupsAndWait(groups []Group, runWGs []sync.WaitGroup, runAt int) error {
+	var errs []error
+	for i := runAt; i >= 0; i-- {
+		if err := stopGroup(groups[i]); err != nil {
+			errs = append(errs, fmt.Errorf("close group %d: %w", i, err))
+		}
+		runWGs[i].Wait()
+	}
+
+	return joinErrors(errs...)
+}
+
+func stopGroup(group Group) error {
+	errs := make([]error, len(group))
 	var wg sync.WaitGroup
-	for _, comp := range group {
+	for i, comp := range group {
 		wg.Add(1)
-		go func(c Component) {
+		go func(index int, c Component) {
 			defer wg.Done()
-			_ = c.Close() // Ignore close error.
-		}(comp)
+			if err := c.Close(); err != nil {
+				errs[index] = fmt.Errorf(
+					"component %s/%s: %w",
+					c.Name(),
+					c.Instance(),
+					err,
+				)
+			}
+		}(i, comp)
 	}
 	wg.Wait()
+
+	return joinErrors(errs...)
 }

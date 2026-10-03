@@ -17,9 +17,15 @@ package config
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	stderrors "errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,8 +43,25 @@ import (
 type Manager interface {
 	component.Component
 	AppConfig() *App
-	SaveAppConfig(app *App) error
+	// AppConfigSnapshot returns one immutable-by-convention config snapshot and
+	// the revision that must be supplied to perform an optimistic update.
+	AppConfigSnapshot() (*App, string)
+	// SaveAppConfig atomically replaces the config when expectedRevision matches
+	// the current file. The revision is mandatory for every write.
+	SaveAppConfig(app *App, expectedRevision *string) error
 	Subscribe(w Watcher)
+}
+
+const SecretPlaceholder = "<redacted>"
+
+// RevisionConflictError reports that the config file changed since it was queried.
+type RevisionConflictError struct {
+	Expected string
+	Actual   string
+}
+
+func (e *RevisionConflictError) Error() string {
+	return fmt.Sprintf("config revision conflict: expected %q, current %q", e.Expected, e.Actual)
 }
 
 type Config struct {
@@ -48,20 +71,21 @@ type Config struct {
 type App struct {
 	Timezone  string `yaml:"timezone,omitempty" json:"timezone,omitempty" desc:"The timezone of the app. e.g. Asia/Shanghai. Default: server's local timezone"`
 	Telemetry struct {
-		Address string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the telemetry server. e.g. 0.0.0.0:9090. Default: :9090. It can not be changed after the app is running."`
+		Address string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the telemetry server. e.g. 0.0.0.0:9090. Default: 127.0.0.1:9090. It can not be changed after the app is running."`
 		Log     struct {
 			Level string `yaml:"level,omitempty" json:"level,omitempty" desc:"Log level, one of debug, info, warn, error. Default: info"`
 		} `yaml:"log,omitempty" json:"log,omitempty" desc:"The log config."`
 	} `yaml:"telemetry,omitempty" json:"telemetry,omitempty" desc:"The telemetry config."`
 	API struct {
 		HTTP struct {
-			Address string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the HTTP API. e.g. 0.0.0.0:1300. Default: :1300. It can not be changed after the app is running."`
+			Address        string    `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the HTTP API. e.g. 0.0.0.0:1300. Default: 127.0.0.1:1300. It can not be changed after the app is running."`
+			AllowedOrigins *[]string `yaml:"allowed_origins,omitempty" json:"allowed_origins,omitempty" desc:"Exact browser origins allowed to call the HTTP API. Defaults to local web UI origins only. Set an empty list to disable cross-origin access."`
 		} `yaml:"http,omitempty" json:"http,omitempty" desc:"The HTTP API config."`
 		MCP struct {
-			Address string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the MCP API. e.g. 0.0.0.0:1300. Default: :1301. It can not be changed after the app is running."`
+			Address string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the MCP API. e.g. 0.0.0.0:1301. Default: 127.0.0.1:1301. It can not be changed after the app is running."`
 		} `yaml:"mcp,omitempty" json:"mcp,omitempty" desc:"The MCP API config."`
 		RSS struct {
-			Address             string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the RSS API. e.g. 0.0.0.0:1300. Default: :1302. It can not be changed after the app is running."`
+			Address             string `yaml:"address,omitempty" json:"address,omitempty" desc:"The address ([host]:port) of the RSS API. e.g. 0.0.0.0:1302. Default: 127.0.0.1:1302. It can not be changed after the app is running."`
 			ContentHTMLTemplate string `yaml:"content_html_template,omitempty" json:"content_html_template,omitempty" desc:"The template to render the RSS content for each item. Default is {{ .summary_html_snippet }}."`
 		} `yaml:"rss,omitempty" json:"rss,omitempty" desc:"The RSS config."`
 		LLM string `yaml:"llm,omitempty" json:"llm,omitempty" desc:"The LLM name for summarizing feeds. e.g. my-favorite-gemini-king. Default is the default LLM in llms section."`
@@ -125,10 +149,15 @@ type ObjectStorage struct {
 }
 
 type ScrapeSource struct {
+	Enabled  *bool             `yaml:"enabled,omitempty" json:"enabled,omitempty" desc:"Whether this source is enabled. Omitted defaults to true."`
 	Interval timeutil.Duration `yaml:"interval,omitempty" json:"interval,omitempty" desc:"How often to scrape this source. Default: global interval"`
 	Name     string            `yaml:"name,omitempty" json:"name,omitempty" desc:"The name of the source. It is required."`
 	Labels   map[string]string `yaml:"labels,omitempty" json:"labels,omitempty" desc:"The additional labels to add to the feed of this source."`
 	RSS      *ScrapeSourceRSS  `yaml:"rss,omitempty" json:"rss,omitempty" desc:"The RSS config of the source."`
+}
+
+func (s ScrapeSource) IsEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
 }
 
 type ScrapeSourceRSS struct {
@@ -211,7 +240,7 @@ type NotifyReceiver struct {
 }
 
 type NotifyReceiverWebhook struct {
-	URL string `yaml:"url"`
+	URL string `yaml:"url" json:"url"`
 }
 
 type NotifyChannels struct {
@@ -267,8 +296,6 @@ func new(instance string, config *Config, dependencies Dependencies) (Manager, e
 			Config:       config,
 			Dependencies: dependencies,
 		}),
-		changedByAPI:    make(chan struct{}, 1),
-		apiReloadResult: make(chan error, 1),
 	}
 	if err := m.tryReloadAppConfig(m.Context()); err != nil {
 		return nil, errors.Wrap(err, "reload config")
@@ -281,12 +308,18 @@ func new(instance string, config *Config, dependencies Dependencies) (Manager, e
 type manager struct {
 	*component.Base[Config, Dependencies]
 
-	app         *App
-	subscribers []Watcher
-	mu          sync.RWMutex
-
-	changedByAPI    chan struct{}
-	apiReloadResult chan error
+	// app is the last config successfully applied to every watcher. diskApp and
+	// revision describe the latest parseable on-disk state returned to API
+	// clients. They intentionally diverge while a reload is pending.
+	app           *App
+	diskApp       *App
+	revision      string
+	reloadPending bool
+	degradedError error
+	subscribers   []Watcher
+	mu            sync.RWMutex
+	saveMu        sync.Mutex
+	atomicWrite   func(path string, data []byte, mode fs.FileMode) error
 }
 
 func (m *manager) Run() (err error) {
@@ -302,12 +335,6 @@ func (m *manager) Run() (err error) {
 			if err := m.tryReloadAppConfig(ctx); err != nil {
 				log.Error(ctx, err, "try reload app config on tick")
 			}
-		case <-m.changedByAPI:
-			err := m.tryReloadAppConfig(ctx)
-			if err != nil {
-				log.Error(ctx, err, "try reload app config on api change")
-			}
-			m.apiReloadResult <- err
 		case <-ctx.Done():
 			return nil
 		}
@@ -318,40 +345,121 @@ func (m *manager) AppConfig() *App {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return m.app
+	return cloneApp(m.app)
 }
-func (m *manager) SaveAppConfig(app *App) error {
-	b, err := yaml.Marshal(app)
+
+func (m *manager) AppConfigSnapshot() (*App, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.diskApp != nil {
+		return cloneApp(m.diskApp), m.revision
+	}
+
+	return cloneApp(m.app), m.revision
+}
+
+func (m *manager) SaveAppConfig(app *App, expectedRevision *string) error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
+	if expectedRevision == nil || strings.TrimSpace(*expectedRevision) == "" {
+		return errors.New("config revision is required")
+	}
+	m.mu.RLock()
+	oldApplied := cloneApp(m.app)
+	m.mu.RUnlock()
+
+	currentBytes, err := os.ReadFile(m.Config().Path)
+	if err != nil {
+		return errors.Wrap(err, "read current app config")
+	}
+	actualRevision := appConfigRevision(currentBytes)
+	if *expectedRevision != actualRevision {
+		conflict := &RevisionConflictError{Expected: *expectedRevision, Actual: actualRevision}
+		if err := m.reloadAppConfig(m.Context()); err != nil {
+			return errors.Wrapf(conflict, "refresh current app config after conflict: %v", err)
+		}
+
+		return conflict
+	}
+
+	var current App
+	if err := yaml.Unmarshal(currentBytes, &current); err != nil {
+		return errors.Wrap(err, "parse current app config")
+	}
+	next := cloneApp(app)
+	if err := restoreRedactedSecrets(next, &current); err != nil {
+		return errors.Wrap(err, "restore redacted secrets")
+	}
+	nextBytes, err := yaml.Marshal(next)
 	if err != nil {
 		return errors.Wrap(err, "marshal app config")
 	}
 
-	// Create temp file in the same directory.
-	dir := filepath.Dir(m.Config().Path)
-	tmpFile, err := os.CreateTemp(dir, "*.tmp.yaml")
+	info, err := os.Stat(m.Config().Path)
 	if err != nil {
-		return errors.Wrap(err, "create temp file")
+		return errors.Wrap(err, "stat current app config")
 	}
-	tmpPath := tmpFile.Name()
+	tmpPath, err := prepareAtomicFile(m.Config().Path, nextBytes, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
 	defer func() { _ = os.Remove(tmpPath) }()
 
-	// Write to temp file.
-	if err := os.WriteFile(tmpPath, b, 0644); err != nil {
-		return errors.Wrap(err, "write temp config")
+	// Recheck immediately before rename. POSIX has no compare-and-swap rename, so
+	// an external editor can still race this final check, but the window is kept
+	// to the single read/rename pair.
+	latestBytes, err := os.ReadFile(m.Config().Path)
+	if err != nil {
+		return errors.Wrap(err, "re-read current app config")
+	}
+	latestRevision := appConfigRevision(latestBytes)
+	if latestRevision != actualRevision {
+		if err := m.reloadAppConfig(m.Context()); err != nil {
+			return errors.Wrapf(
+				&RevisionConflictError{Expected: *expectedRevision, Actual: latestRevision},
+				"refresh current app config after conflict: %v", err,
+			)
+		}
+
+		return &RevisionConflictError{Expected: *expectedRevision, Actual: latestRevision}
 	}
 
-	// Atomic rename.
 	if err := os.Rename(tmpPath, m.Config().Path); err != nil {
 		return errors.Wrap(err, "rename config file")
 	}
+	if err := syncDirectory(filepath.Dir(m.Config().Path)); err != nil {
+		rollbackErr := m.writeConfig(m.Config().Path, currentBytes, info.Mode().Perm())
+		if rollbackErr != nil {
+			reconcileErr := m.publishDiskSnapshot(errors.Wrap(err, "sync config directory"))
 
-	select {
-	case m.changedByAPI <- struct{}{}:
-	default:
+			return combineRollbackErrors(errors.Wrap(err, "sync config directory"), rollbackErr, reconcileErr)
+		}
+		m.publishRestoredState(oldApplied, &current, actualRevision, nil)
+
+		return errors.Wrap(err, "sync config directory; previous config restored")
 	}
-	if err := <-m.apiReloadResult; err != nil {
-		return errors.Wrap(err, "reload app config")
+
+	subscribers := m.subscriberSnapshot()
+	attempted, reloadErr := notifySubscribers(m.Context(), subscribers, next)
+	if reloadErr != nil {
+		rollbackErr := m.writeConfig(m.Config().Path, currentBytes, info.Mode().Perm())
+		watcherRollbackErr := rollbackSubscribers(m.Context(), subscribers[:attempted], oldApplied)
+		var stateRecoveryErr error
+		if rollbackErr == nil {
+			m.publishRestoredState(oldApplied, &current, actualRevision, watcherRollbackErr)
+		} else {
+			stateRecoveryErr = m.publishDiskSnapshot(errors.Wrap(reloadErr, "reload app config"))
+		}
+
+		return combineRollbackErrors(
+			errors.Wrap(reloadErr, "reload app config"),
+			rollbackErr,
+			stderrors.Join(watcherRollbackErr, stateRecoveryErr),
+		)
 	}
+	m.setAppliedSnapshot(next, appConfigRevision(nextBytes))
 
 	return nil
 }
@@ -363,10 +471,16 @@ func (m *manager) Subscribe(w Watcher) {
 }
 
 func (m *manager) tryReloadAppConfig(ctx context.Context) (err error) {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
+	return m.reloadAppConfig(ctx)
+}
+
+// reloadAppConfig reloads the file while saveMu is held by the caller.
+func (m *manager) reloadAppConfig(ctx context.Context) (err error) {
 	ctx = telemetry.StartWith(ctx, append(m.TelemetryLabels(), telemetrymodel.KeyOperation, "tryReloadAppConfig")...)
 	defer func() { telemetry.End(ctx, err) }()
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Read the config file.
 	b, err := os.ReadFile(m.Config().Path)
@@ -377,26 +491,345 @@ func (m *manager) tryReloadAppConfig(ctx context.Context) (err error) {
 	if err := yaml.Unmarshal(b, &newConfig); err != nil {
 		return errors.Wrap(err, "parse config file")
 	}
+	newRevision := appConfigRevision(b)
 
-	// Diff the new config with the old one.
-	if reflect.DeepEqual(m.app, &newConfig) {
+	m.mu.RLock()
+	oldConfig := cloneApp(m.app)
+	configChanged := !reflect.DeepEqual(oldConfig, &newConfig)
+	reloadPending := m.reloadPending
+	subscribers := append([]Watcher(nil), m.subscribers...)
+	m.mu.RUnlock()
+	if !configChanged && !reloadPending {
+		m.setAppliedSnapshot(&newConfig, newRevision)
 		log.Debug(ctx, "config is the same, skipping reload")
 
 		return nil
 	}
+	attempted, reloadErr := notifySubscribers(ctx, subscribers, &newConfig)
+	if reloadErr != nil {
+		rollbackErr := rollbackSubscribers(ctx, subscribers[:attempted], oldConfig)
+		combinedErr := combineRollbackErrors(errors.Wrap(reloadErr, "notify subscribers"), nil, rollbackErr)
+		m.setDiskSnapshot(&newConfig, newRevision, combinedErr)
 
-	// Notify the subscribers.
-	for _, s := range m.subscribers {
-		log.Debug(ctx, "notifying subscriber", "subscriber", s.Name())
-		if err := s.Reload(&newConfig); err != nil {
-			return errors.Wrap(err, "notify subscribers")
+		return combinedErr
+	}
+	m.setAppliedSnapshot(&newConfig, newRevision)
+
+	return nil
+}
+
+func (m *manager) subscriberSnapshot() []Watcher {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return append([]Watcher(nil), m.subscribers...)
+}
+
+func (m *manager) setAppliedSnapshot(app *App, revision string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.app = cloneApp(app)
+	m.diskApp = cloneApp(app)
+	m.revision = revision
+	m.reloadPending = false
+	m.degradedError = nil
+}
+
+func (m *manager) setDiskSnapshot(app *App, revision string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.diskApp = cloneApp(app)
+	m.revision = revision
+	m.reloadPending = true
+	m.degradedError = err
+}
+
+func (m *manager) writeConfig(path string, data []byte, mode fs.FileMode) error {
+	if m.atomicWrite != nil {
+		return m.atomicWrite(path, data, mode)
+	}
+
+	return atomicWriteFile(path, data, mode)
+}
+
+// publishDiskSnapshot prevents callers from receiving a revision for state that
+// is no longer on disk after a failed rollback. If the disk state itself cannot
+// be decoded, the empty revision makes subsequent writes fail closed.
+func (m *manager) publishDiskSnapshot(cause error) error {
+	b, err := os.ReadFile(m.Config().Path)
+	if err != nil {
+		m.markDegraded(errors.Wrapf(cause, "read config after failed rollback: %v", err))
+
+		return err
+	}
+	var app App
+	if err := yaml.Unmarshal(b, &app); err != nil {
+		m.markDegraded(errors.Wrapf(cause, "parse config after failed rollback: %v", err))
+
+		return err
+	}
+	m.setDiskSnapshot(&app, appConfigRevision(b), cause)
+
+	return nil
+}
+
+func (m *manager) markDegraded(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revision = ""
+	m.reloadPending = true
+	m.degradedError = err
+}
+
+func (m *manager) publishRestoredState(applied, disk *App, revision string, recoveryErr error) {
+	if recoveryErr == nil && reflect.DeepEqual(applied, disk) {
+		m.setAppliedSnapshot(applied, revision)
+
+		return
+	}
+	m.setDiskSnapshot(disk, revision, recoveryErr)
+}
+
+func notifySubscribers(ctx context.Context, subscribers []Watcher, app *App) (int, error) {
+	for i, subscriber := range subscribers {
+		log.Debug(ctx, "notifying subscriber", "subscriber", subscriber.Name())
+		if err := subscriber.Reload(cloneApp(app)); err != nil {
+			return i + 1, err
 		}
 	}
 
-	// Update the config.
-	m.app = &newConfig
+	return len(subscribers), nil
+}
+
+func rollbackSubscribers(ctx context.Context, subscribers []Watcher, app *App) error {
+	var rollbackErrors []string
+	for i := len(subscribers) - 1; i >= 0; i-- {
+		if err := subscribers[i].Reload(cloneApp(app)); err != nil {
+			log.Error(ctx, err, "rollback subscriber", "subscriber", subscribers[i].Name())
+			rollbackErrors = append(rollbackErrors, fmt.Sprintf("%s: %v", subscribers[i].Name(), err))
+		}
+	}
+	if len(rollbackErrors) > 0 {
+		return errors.Errorf("rollback subscribers: %s", strings.Join(rollbackErrors, "; "))
+	}
 
 	return nil
+}
+
+func combineRollbackErrors(primary, fileRollback, watcherRollback error) error {
+	var details []string
+	if fileRollback != nil {
+		details = append(details, "file: "+fileRollback.Error())
+	}
+	if watcherRollback != nil {
+		details = append(details, watcherRollback.Error())
+	}
+	if len(details) == 0 {
+		return primary
+	}
+
+	return errors.Wrapf(primary, "rollback incomplete (%s)", strings.Join(details, "; "))
+}
+
+func prepareAtomicFile(path string, data []byte, mode fs.FileMode) (tmpPath string, err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".zenfeed-config-*.tmp")
+	if err != nil {
+		return "", errors.Wrap(err, "create temp config")
+	}
+	tmpPath = tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err = tmp.Chmod(mode); err != nil {
+		return "", errors.Wrap(err, "set temp config permissions")
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return "", errors.Wrap(err, "write temp config")
+	}
+	if err = tmp.Sync(); err != nil {
+		return "", errors.Wrap(err, "sync temp config")
+	}
+	if err = tmp.Close(); err != nil {
+		return "", errors.Wrap(err, "close temp config")
+	}
+
+	return tmpPath, nil
+}
+
+func atomicWriteFile(path string, data []byte, mode fs.FileMode) error {
+	tmpPath, err := prepareAtomicFile(path, data, mode)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := os.Rename(tmpPath, path); err != nil {
+		return errors.Wrap(err, "rename config file")
+	}
+
+	return syncDirectory(filepath.Dir(path))
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+
+	return dir.Sync()
+}
+
+func appConfigRevision(b []byte) string {
+	sum := sha256.Sum256(b)
+
+	return hex.EncodeToString(sum[:])
+}
+
+// RedactedAppConfig returns a copy suitable for untrusted API responses. The
+// placeholder is deliberately stable so a client can send it back unchanged.
+func RedactedAppConfig(app *App) *App {
+	redacted := cloneApp(app)
+	if redacted == nil {
+		return nil
+	}
+	for i := range redacted.LLMs {
+		redact(&redacted.LLMs[i].APIKey)
+	}
+	redact(&redacted.Jina.Token)
+	redact(&redacted.Scrape.RSSHubAccessKey)
+	redact(&redacted.Storage.Object.AccessKeyID)
+	redact(&redacted.Storage.Object.SecretAccessKey)
+	if redacted.Notify.Channels.Email != nil {
+		redact(&redacted.Notify.Channels.Email.Password)
+	}
+	for i := range redacted.Notify.Receivers {
+		if redacted.Notify.Receivers[i].Webhook != nil {
+			redact(&redacted.Notify.Receivers[i].Webhook.URL)
+		}
+	}
+
+	return redacted
+}
+
+func redact(value *string) {
+	if *value != "" {
+		*value = SecretPlaceholder
+	}
+}
+
+func restoreRedactedSecrets(next, current *App) error {
+	if next == nil || current == nil {
+		return errors.New("config cannot be nil")
+	}
+
+	if err := validateUniqueLLMNames(current.LLMs, "current"); err != nil {
+		return err
+	}
+	if err := validateUniqueLLMNames(next.LLMs, "new"); err != nil {
+		return err
+	}
+	if err := validateUniqueWebhookReceiverNames(current.Notify.Receivers, "current"); err != nil {
+		return err
+	}
+	if err := validateUniqueWebhookReceiverNames(next.Notify.Receivers, "new"); err != nil {
+		return err
+	}
+
+	currentLLMs := make(map[string]string, len(current.LLMs))
+	for _, llm := range current.LLMs {
+		currentLLMs[llm.Name] = llm.APIKey
+	}
+	for i := range next.LLMs {
+		if next.LLMs[i].APIKey == SecretPlaceholder {
+			secret, ok := currentLLMs[next.LLMs[i].Name]
+			if !ok {
+				return errors.Errorf("cannot preserve api_key for unknown llm %q", next.LLMs[i].Name)
+			}
+			next.LLMs[i].APIKey = secret
+		}
+	}
+	preserveSecret(&next.Jina.Token, current.Jina.Token)
+	preserveSecret(&next.Scrape.RSSHubAccessKey, current.Scrape.RSSHubAccessKey)
+	preserveSecret(&next.Storage.Object.AccessKeyID, current.Storage.Object.AccessKeyID)
+	preserveSecret(&next.Storage.Object.SecretAccessKey, current.Storage.Object.SecretAccessKey)
+	if next.Notify.Channels.Email != nil && next.Notify.Channels.Email.Password == SecretPlaceholder {
+		if current.Notify.Channels.Email == nil {
+			return errors.New("cannot preserve email password without an existing email channel")
+		}
+		next.Notify.Channels.Email.Password = current.Notify.Channels.Email.Password
+	}
+
+	currentWebhooks := make(map[string]string, len(current.Notify.Receivers))
+	for _, receiver := range current.Notify.Receivers {
+		if receiver.Webhook != nil {
+			currentWebhooks[receiver.Name] = receiver.Webhook.URL
+		}
+	}
+	for i := range next.Notify.Receivers {
+		receiver := &next.Notify.Receivers[i]
+		if receiver.Webhook == nil || receiver.Webhook.URL != SecretPlaceholder {
+			continue
+		}
+		secret, ok := currentWebhooks[receiver.Name]
+		if !ok {
+			return errors.Errorf("cannot preserve webhook url for unknown receiver %q", receiver.Name)
+		}
+		receiver.Webhook.URL = secret
+	}
+
+	return nil
+}
+
+func validateUniqueLLMNames(llms []LLM, location string) error {
+	seen := make(map[string]struct{}, len(llms))
+	for _, llm := range llms {
+		if _, ok := seen[llm.Name]; ok {
+			return errors.Errorf("duplicate LLM name %q in %s config", llm.Name, location)
+		}
+		seen[llm.Name] = struct{}{}
+	}
+
+	return nil
+}
+
+func validateUniqueWebhookReceiverNames(receivers []NotifyReceiver, location string) error {
+	seen := make(map[string]struct{}, len(receivers))
+	for _, receiver := range receivers {
+		if _, ok := seen[receiver.Name]; ok {
+			return errors.Errorf("duplicate webhook receiver name %q in %s config", receiver.Name, location)
+		}
+		seen[receiver.Name] = struct{}{}
+	}
+
+	return nil
+}
+
+func preserveSecret(next *string, current string) {
+	if *next == SecretPlaceholder {
+		*next = current
+	}
+}
+
+func cloneApp(app *App) *App {
+	if app == nil {
+		return nil
+	}
+
+	b, err := yaml.Marshal(app)
+	if err != nil {
+		clone := *app
+
+		return &clone
+	}
+	var clone App
+	if err := yaml.Unmarshal(b, &clone); err != nil {
+		clone = *app
+	}
+
+	return &clone
 }
 
 type mockManager struct {
@@ -409,8 +842,14 @@ func (m *mockManager) AppConfig() *App {
 	return args.Get(0).(*App)
 }
 
-func (m *mockManager) SaveAppConfig(app *App) error {
-	args := m.Called(app)
+func (m *mockManager) AppConfigSnapshot() (*App, string) {
+	args := m.Called()
+
+	return args.Get(0).(*App), args.String(1)
+}
+
+func (m *mockManager) SaveAppConfig(app *App, expectedRevision *string) error {
+	args := m.Called(app, expectedRevision)
 
 	return args.Error(0)
 }

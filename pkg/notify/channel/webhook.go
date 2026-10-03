@@ -49,7 +49,7 @@ type webhookBody struct {
 
 func newWebhook() sender {
 	return &webhook{
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Timeout: sendTimeout},
 	}
 }
 

@@ -1,0 +1,12 @@
+services:
+  zenfeed-web:
+    image: zenfeed-web:local
+    build:
+      context: ../zenfeed-web
+      dockerfile: Dockerfile
+
+  zenfeed:
+    image: zenfeed:local
+    build:
+      context: .
+      dockerfile: Dockerfile

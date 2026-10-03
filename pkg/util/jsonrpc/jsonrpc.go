@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 
 	"github.com/glidea/zenfeed/pkg/api"
@@ -26,18 +28,55 @@ import (
 
 type Handler[Request any, Response any] func(ctx context.Context, req *Request) (*Response, error)
 
-func API[Request any, Response any](handler Handler[Request, Response]) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowCORS(w)
+const (
+	DefaultMaxRequestBodyBytes int64 = 1 << 20
+	WriteMaxRequestBodyBytes   int64 = 8 << 20
+)
 
-		if r.Method == "OPTIONS" {
+func API[Request any, Response any](handler Handler[Request, Response]) http.Handler {
+	return APIWithLimit(handler, DefaultMaxRequestBodyBytes)
+}
+
+func APIWithLimit[Request any, Response any](
+	handler Handler[Request, Response],
+	maxRequestBodyBytes int64,
+) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "POST, OPTIONS")
+
+		switch r.Method {
+		case http.MethodOptions:
+			return
+		case http.MethodPost:
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
 			return
 		}
 
 		var req Request
 		if r.Body != http.NoBody {
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+			if contentType := r.Header.Get("Content-Type"); contentType != "" {
+				mediaType, _, err := mime.ParseMediaType(contentType)
+				if err != nil || mediaType != "application/json" {
+					http.Error(w, "request body must use application/json", http.StatusUnsupportedMediaType)
+
+					return
+				}
+			}
+
+			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
+			if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				writeDecodeError(w, err)
+
+				return
+			}
+			if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+				if err == nil {
+					http.Error(w, "request body must contain exactly one JSON value", http.StatusBadRequest)
+				} else {
+					writeDecodeError(w, err)
+				}
 
 				return
 			}
@@ -68,10 +107,12 @@ func API[Request any, Response any](handler Handler[Request, Response]) http.Han
 	})
 }
 
-func allowCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers",
-		"Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization",
-	)
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
 }

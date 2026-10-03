@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"time"
 
 	"github.com/pkg/errors"
 	oai "github.com/sashabaranov/go-openai"
@@ -38,6 +40,7 @@ type openai struct {
 func newOpenAI(c *Config) LLM {
 	config := oai.DefaultConfig(c.APIKey)
 	config.BaseURL = c.Endpoint
+	config.HTTPClient = &http.Client{Timeout: 2 * time.Minute}
 	client := oai.NewClientWithConfig(config)
 	embeddingSpliter := newEmbeddingSpliter(1536, 64)
 

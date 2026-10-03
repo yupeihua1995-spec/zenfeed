@@ -17,7 +17,9 @@ package kv
 
 import (
 	"context"
+	stderrors "errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nutsdb/nutsdb"
@@ -27,6 +29,7 @@ import (
 	"github.com/glidea/zenfeed/pkg/config"
 	"github.com/glidea/zenfeed/pkg/telemetry"
 	telemetrymodel "github.com/glidea/zenfeed/pkg/telemetry/model"
+	"github.com/glidea/zenfeed/pkg/util/lifecycle"
 )
 
 // --- Interface code block ---
@@ -98,10 +101,22 @@ func new(instance string, app *config.App, dependencies Dependencies) (Storage, 
 // --- Implementation code block ---
 type kv struct {
 	*component.Base[Config, Dependencies]
-	db *nutsdb.DB
+	db              *nutsdb.DB
+	lifecycleMu     sync.RWMutex
+	closed          bool
+	close           lifecycle.Once
+	beforeMarkReady func()
 }
 
 func (k *kv) Run() error {
+	k.lifecycleMu.Lock()
+	if k.closed {
+		k.lifecycleMu.Unlock()
+
+		return errors.New("KV storage is closed")
+	}
+	k.lifecycleMu.Unlock()
+
 	db, err := nutsdb.Open(
 		nutsdb.DefaultOptions,
 		nutsdb.WithDir(k.Config().Dir),
@@ -117,22 +132,49 @@ func (k *kv) Run() error {
 
 		return nil
 	}); err != nil {
-		return errors.Wrap(err, "create bucket")
+		return stderrors.Join(
+			errors.Wrap(err, "create bucket"),
+			errors.Wrap(db.Close(), "close db after bucket creation failure"),
+		)
+	}
+
+	k.lifecycleMu.Lock()
+	if k.closed {
+		k.lifecycleMu.Unlock()
+
+		return stderrors.Join(
+			errors.New("KV storage closed during startup"),
+			errors.Wrap(db.Close(), "close db after canceled startup"),
+		)
 	}
 	k.db = db
-
+	if k.beforeMarkReady != nil {
+		k.beforeMarkReady()
+	}
 	k.MarkReady()
+	k.lifecycleMu.Unlock()
 	<-k.Context().Done()
 
 	return nil
 }
 
 func (k *kv) Close() error {
-	if err := k.Base.Close(); err != nil {
-		return errors.Wrap(err, "close base")
-	}
+	return k.close.Do(func() error {
+		baseErr := k.Base.Close()
 
-	return k.db.Close()
+		k.lifecycleMu.Lock()
+		k.closed = true
+		db := k.db
+		if db == nil {
+			k.lifecycleMu.Unlock()
+			return baseErr
+		}
+		dbErr := db.Close()
+		k.db = nil
+		k.lifecycleMu.Unlock()
+
+		return stderrors.Join(baseErr, dbErr)
+	})
 }
 
 const bucket = "0"
@@ -148,6 +190,11 @@ func (k *kv) Get(ctx context.Context, key []byte) (value []byte, err error) {
 			return nil
 		}())
 	}()
+	k.lifecycleMu.RLock()
+	defer k.lifecycleMu.RUnlock()
+	if k.db == nil {
+		return nil, errors.New("KV storage is not ready")
+	}
 
 	var b []byte
 	err = k.db.View(func(tx *nutsdb.Tx) error {
@@ -170,6 +217,11 @@ func (k *kv) Get(ctx context.Context, key []byte) (value []byte, err error) {
 func (k *kv) Set(ctx context.Context, key []byte, value []byte, ttl time.Duration) (err error) {
 	ctx = telemetry.StartWith(ctx, append(k.TelemetryLabels(), telemetrymodel.KeyOperation, "Set")...)
 	defer func() { telemetry.End(ctx, err) }()
+	k.lifecycleMu.RLock()
+	defer k.lifecycleMu.RUnlock()
+	if k.db == nil {
+		return errors.New("KV storage is not ready")
+	}
 
 	return k.db.Update(func(tx *nutsdb.Tx) error {
 		return tx.Put(bucket, key, value, uint32(ttl.Seconds()))

@@ -16,7 +16,10 @@
 package scrape
 
 import (
+	"context"
+	stderrors "errors"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -30,16 +33,25 @@ import (
 	"github.com/glidea/zenfeed/pkg/telemetry"
 	"github.com/glidea/zenfeed/pkg/telemetry/log"
 	telemetrymodel "github.com/glidea/zenfeed/pkg/telemetry/model"
+	"github.com/glidea/zenfeed/pkg/util/lifecycle"
 )
 
 // --- Interface code block ---
 type Manager interface {
 	component.Component
 	config.Watcher
+	Statuses(context.Context) []scraper.Status
+	Refresh(string) error
 }
 
 type Config struct {
 	Scrapers []scraper.Config
+	Sources  []sourceConfig
+}
+
+type sourceConfig struct {
+	Enabled bool
+	Scraper scraper.Config
 }
 
 func (c *Config) Validate() error {
@@ -63,25 +75,33 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) From(app *config.App) {
-	c.Scrapers = make([]scraper.Config, len(app.Scrape.Sources))
+	c.Scrapers = make([]scraper.Config, 0, len(app.Scrape.Sources))
+	c.Sources = make([]sourceConfig, 0, len(app.Scrape.Sources))
 	for i := range app.Scrape.Sources {
-		c.Scrapers[i] = scraper.Config{
+		source := &app.Scrape.Sources[i]
+		scraperConfig := scraper.Config{
 			Past:     time.Duration(app.Scrape.Past),
-			Name:     app.Scrape.Sources[i].Name,
-			Interval: time.Duration(app.Scrape.Sources[i].Interval),
+			Name:     source.Name,
+			Interval: time.Duration(source.Interval),
 			Labels:   model.Labels{},
 		}
-		c.Scrapers[i].Labels.FromMap(app.Scrape.Sources[i].Labels)
-		if c.Scrapers[i].Interval <= 0 {
-			c.Scrapers[i].Interval = time.Duration(app.Scrape.Interval)
+		scraperConfig.Labels.FromMap(source.Labels)
+		if scraperConfig.Interval <= 0 {
+			scraperConfig.Interval = time.Duration(app.Scrape.Interval)
 		}
-		if app.Scrape.Sources[i].RSS != nil {
-			c.Scrapers[i].RSS = &scraper.ScrapeSourceRSS{
-				URL:             app.Scrape.Sources[i].RSS.URL,
+		if source.RSS != nil {
+			scraperConfig.RSS = &scraper.ScrapeSourceRSS{
+				URL:             source.RSS.URL,
 				RSSHubEndpoint:  app.Scrape.RSSHubEndpoint,
-				RSSHubRoutePath: app.Scrape.Sources[i].RSS.RSSHubRoutePath,
+				RSSHubRoutePath: source.RSS.RSSHubRoutePath,
 				RSSHubAccessKey: app.Scrape.RSSHubAccessKey,
 			}
+		}
+		_ = scraperConfig.Validate()
+		enabled := source.IsEnabled()
+		c.Sources = append(c.Sources, sourceConfig{Enabled: enabled, Scraper: scraperConfig})
+		if enabled {
+			c.Scrapers = append(c.Scrapers, scraperConfig)
 		}
 	}
 }
@@ -124,14 +144,18 @@ func new(instance string, app *config.App, dependencies Dependencies) (Manager, 
 			Config:       config,
 			Dependencies: dependencies,
 		}),
-		scrapers: make(map[string]scraper.Scraper, len(config.Scrapers)),
+		scrapers:   make(map[string]scraper.Scraper, len(config.Scrapers)),
+		childExits: make(chan scraperExit, 1),
 	}
 
 	for i := range config.Scrapers {
 		c := &config.Scrapers[i]
 		s, err := m.newScraper(c)
 		if err != nil {
-			return nil, errors.Wrapf(err, "creating scraper %s", c.Name)
+			return nil, stderrors.Join(
+				errors.Wrapf(err, "creating scraper %s", c.Name),
+				m.Close(),
+			)
 		}
 		m.scrapers[c.Name] = s
 	}
@@ -143,23 +167,103 @@ func new(instance string, app *config.App, dependencies Dependencies) (Manager, 
 type manager struct {
 	*component.Base[Config, Dependencies]
 
-	scrapers map[string]scraper.Scraper
+	scrapers      map[string]scraper.Scraper
+	ownedScrapers map[string]*ownedScraper
+	lifecycleMu   sync.Mutex
+	closed        bool
+	starting      bool
+	running       bool
+	close         lifecycle.Once
+	childExits    chan scraperExit
+}
+
+type scraperExit struct {
+	child *ownedScraper
+	err   error
+}
+
+var (
+	ErrSourceNotFound  = errors.New("source not found")
+	ErrSourceDisabled  = errors.New("source is disabled")
+	ErrManagerNotReady = errors.New("scrape manager is not ready")
+)
+
+type ownedScraper struct {
+	scraper.Scraper
+	owner     *lifecycle.Owned
+	watchOnce sync.Once
+}
+
+func newOwnedScraper(child scraper.Scraper) *ownedScraper {
+	return &ownedScraper{Scraper: child, owner: lifecycle.NewOwned(child)}
+}
+
+func (s *ownedScraper) Run() error { return s.owner.Run() }
+
+func (s *ownedScraper) Close() error {
+	return s.owner.Close()
+}
+
+func (s *ownedScraper) watch(ctx context.Context, exits chan<- scraperExit) {
+	s.watchOnce.Do(func() {
+		go func() {
+			<-s.owner.Done()
+			if err := s.owner.UnexpectedExit(); err != nil {
+				select {
+				case exits <- scraperExit{child: s, err: err}:
+				case <-ctx.Done():
+				}
+			}
+		}()
+	})
 }
 
 func (m *manager) Run() (err error) {
 	ctx := telemetry.StartWith(m.Context(), append(m.TelemetryLabels(), telemetrymodel.KeyOperation, "Run")...)
-	defer func() { telemetry.End(ctx, err) }()
+	m.lifecycleMu.Lock()
+	if m.closed {
+		m.lifecycleMu.Unlock()
 
-	for _, s := range m.scrapers {
+		return errors.New("manager is closed")
+	}
+	if m.childExits == nil {
+		m.childExits = make(chan scraperExit, 1)
+	}
+	m.starting = true
+	scrapers := m.ownedScrapersLocked()
+	m.lifecycleMu.Unlock()
+
+	defer func() {
+		err = stderrors.Join(err, m.Close())
+		telemetry.End(ctx, err)
+	}()
+
+	for _, s := range scrapers {
 		if err := component.RunUntilReady(ctx, s, 10*time.Second); err != nil {
 			return errors.Wrapf(err, "running scraper %s", s.Config().Name)
 		}
+		s.watch(m.Context(), m.childExits)
+	}
+	if err := stagedScraperExit(scrapers); err != nil {
+		return errors.Wrap(err, "scraper exited during startup")
 	}
 
+	m.lifecycleMu.Lock()
+	m.starting = false
+	m.running = true
+	m.lifecycleMu.Unlock()
 	m.MarkReady()
-	<-ctx.Done()
 
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case exit := <-m.childExits:
+			if m.isCurrentScraper(exit.child) {
+				return errors.Wrapf(exit.err, "scraper %s exited unexpectedly", exit.child.Instance())
+			}
+		}
+	}
 }
 
 func (m *manager) Reload(app *config.App) error {
@@ -167,6 +271,14 @@ func (m *manager) Reload(app *config.App) error {
 	newConfig.From(app)
 	if err := newConfig.Validate(); err != nil {
 		return errors.Wrap(err, "invalid configuration")
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.closed {
+		return errors.New("manager is closed")
+	}
+	if m.starting {
+		return errors.New("manager is starting")
 	}
 	if reflect.DeepEqual(m.Config(), newConfig) {
 		log.Debug(m.Context(), "no changes in scrape config")
@@ -177,12 +289,92 @@ func (m *manager) Reload(app *config.App) error {
 	return m.reload(newConfig)
 }
 
-func (m *manager) Close() error {
-	if err := m.Base.Close(); err != nil {
-		return errors.Wrap(err, "closing base")
+func (m *manager) Statuses(ctx context.Context) []scraper.Status {
+	m.lifecycleMu.Lock()
+	config := m.Config()
+	active := make(map[string]scraper.Scraper, len(m.scrapers))
+	for name, child := range m.scrapers {
+		active[name] = child
+	}
+	m.lifecycleMu.Unlock()
+
+	statuses := make([]scraper.Status, 0, len(config.Sources))
+	for i := range config.Sources {
+		source := &config.Sources[i]
+		if child, ok := active[source.Scraper.Name]; ok {
+			statuses = append(statuses, child.Status())
+			continue
+		}
+		status := scraper.LoadPersistedStatus(ctx, m.Dependencies().KVStorage, &source.Scraper)
+		status.State = scraper.StatusDisabled
+		status.NextRunAt = nil
+		statuses = append(statuses, status)
 	}
 
-	return m.stopAllScrapers()
+	return statuses
+}
+
+func (m *manager) Refresh(name string) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if !m.running {
+		return ErrManagerNotReady
+	}
+	child, ok := m.scrapers[name]
+	if !ok {
+		for _, source := range m.Config().Sources {
+			if source.Scraper.Name == name && !source.Enabled {
+				return ErrSourceDisabled
+			}
+		}
+		return ErrSourceNotFound
+	}
+
+	return child.Trigger()
+}
+
+func (m *manager) Close() error {
+	return m.close.Do(func() error {
+		baseErr := m.Base.Close()
+
+		m.lifecycleMu.Lock()
+		m.closed = true
+		m.starting = false
+		m.running = false
+		scrapers := m.ownedScrapersLocked()
+		m.lifecycleMu.Unlock()
+
+		return stderrors.Join(baseErr, lifecycle.CloseAll(scrapers...))
+	})
+}
+
+func (m *manager) ownedScrapersLocked() []*ownedScraper {
+	if m.ownedScrapers == nil {
+		m.ownedScrapers = make(map[string]*ownedScraper, len(m.scrapers))
+	}
+	owned := make([]*ownedScraper, 0, len(m.scrapers))
+	for name, child := range m.scrapers {
+		wrapper, ok := m.ownedScrapers[name]
+		if !ok {
+			wrapper = newOwnedScraper(child)
+			m.ownedScrapers[name] = wrapper
+		}
+		owned = append(owned, wrapper)
+	}
+
+	return owned
+}
+
+func (m *manager) isCurrentScraper(child *ownedScraper) bool {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	for _, current := range m.ownedScrapers {
+		if current == child {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (m *manager) newScraper(c *scraper.Config) (scraper.Scraper, error) {
@@ -201,27 +393,65 @@ func (m *manager) reload(config *Config) (err error) {
 	defer func() { telemetry.End(ctx, err) }()
 
 	newScrapers := make(map[string]scraper.Scraper, len(m.scrapers))
-	if err := m.runOrRestartScrapers(config, newScrapers); err != nil {
-		return errors.Wrap(err, "run or restart RSS scrapers")
+	newOwnedScrapers := make(map[string]*ownedScraper, len(m.scrapers))
+	created := make([]*ownedScraper, 0, len(config.Scrapers))
+	if err := m.runOrRestartScrapers(config, newScrapers, newOwnedScrapers, &created, m.running); err != nil {
+		return stderrors.Join(
+			errors.Wrap(err, "run or restart RSS scrapers"),
+			errors.Wrap(lifecycle.CloseAll(created...), "close newly created scrapers"),
+		)
 	}
-	if err := m.stopObsoleteScrapers(newScrapers); err != nil {
-		return errors.Wrap(err, "stop obsolete scrapers")
+	if m.running {
+		if err := stagedScraperExit(created); err != nil {
+			return stderrors.Join(
+				err,
+				errors.Wrap(lifecycle.CloseAll(created...), "close newly created scrapers"),
+			)
+		}
 	}
+	replaced := m.replacedScrapers(newOwnedScrapers)
 
 	m.scrapers = newScrapers
+	m.ownedScrapers = newOwnedScrapers
 	m.SetConfig(config)
+	if m.running {
+		for _, child := range created {
+			child.watch(m.Context(), m.childExits)
+		}
+	}
+	if err := lifecycle.CloseAll(replaced...); err != nil {
+		log.Error(ctx, errors.Wrap(err, "stop replaced scrapers"))
+	}
 
 	return nil
 }
 
-func (m *manager) runOrRestartScrapers(config *Config, newScrapers map[string]scraper.Scraper) error {
+func stagedScraperExit(scrapers []*ownedScraper) error {
+	for _, child := range scrapers {
+		select {
+		case <-child.owner.Done():
+			return errors.Wrapf(child.owner.UnexpectedExit(), "new scraper %s exited", child.Instance())
+		default:
+		}
+	}
+
+	return nil
+}
+
+func (m *manager) runOrRestartScrapers(
+	config *Config,
+	newScrapers map[string]scraper.Scraper,
+	newOwnedScrapers map[string]*ownedScraper,
+	created *[]*ownedScraper,
+	runNew bool,
+) error {
 	for i := range config.Scrapers {
 		c := &config.Scrapers[i]
 		if err := c.Validate(); err != nil {
 			return errors.Wrapf(err, "validate scraper %s", c.Name)
 		}
 
-		if err := m.runOrRestartScraper(c, newScrapers); err != nil {
+		if err := m.runOrRestartScraper(c, newScrapers, newOwnedScrapers, created, runNew); err != nil {
 			return errors.Wrapf(err, "run or restart scraper %s", c.Name)
 		}
 	}
@@ -229,19 +459,22 @@ func (m *manager) runOrRestartScrapers(config *Config, newScrapers map[string]sc
 	return nil
 }
 
-func (m *manager) runOrRestartScraper(c *scraper.Config, newScrapers map[string]scraper.Scraper) error {
+func (m *manager) runOrRestartScraper(
+	c *scraper.Config,
+	newScrapers map[string]scraper.Scraper,
+	newOwnedScrapers map[string]*ownedScraper,
+	created *[]*ownedScraper,
+	runNew bool,
+) error {
 	if existing, exists := m.scrapers[c.Name]; exists {
 		if reflect.DeepEqual(existing.Config(), c) {
 			newScrapers[c.Name] = existing
+			newOwnedScrapers[c.Name] = m.ownedScraperLocked(c.Name, existing)
 
 			// No changed.
 			return nil
 		}
 
-		// Config updated.
-		if err := existing.Close(); err != nil {
-			return errors.Wrapf(err, "closing")
-		}
 	}
 
 	// Recreate & Run.
@@ -251,19 +484,17 @@ func (m *manager) runOrRestartScraper(c *scraper.Config, newScrapers map[string]
 			return errors.Wrap(err, "creating")
 		}
 		newScrapers[c.Name] = s
-		if err := component.RunUntilReady(m.Context(), s, 10*time.Second); err != nil {
-			return errors.Wrap(err, "running")
-		}
-	}
-
-	return nil
-}
-
-func (m *manager) stopObsoleteScrapers(newScrapers map[string]scraper.Scraper) error {
-	for id, old := range m.scrapers {
-		if _, exists := newScrapers[id]; !exists {
-			if err := old.Close(); err != nil {
-				return errors.Wrapf(err, "closing scraper %s", id)
+		owned := newOwnedScraper(s)
+		newOwnedScrapers[c.Name] = owned
+		*created = append(*created, owned)
+		if runNew {
+			if err := component.RunUntilReady(m.Context(), owned, 10*time.Second); err != nil {
+				return errors.Wrap(err, "running")
+			}
+			select {
+			case <-owned.owner.Done():
+				return errors.Wrap(owned.owner.UnexpectedExit(), "new scraper exited")
+			default:
 			}
 		}
 	}
@@ -271,18 +502,43 @@ func (m *manager) stopObsoleteScrapers(newScrapers map[string]scraper.Scraper) e
 	return nil
 }
 
-func (m *manager) stopAllScrapers() error {
-	for _, s := range m.scrapers {
-		if err := s.Close(); err != nil {
-			return errors.Wrapf(err, "closing scraper %s", s.Config().Name)
+func (m *manager) replacedScrapers(newScrapers map[string]*ownedScraper) []*ownedScraper {
+	oldScrapers := m.ownedScrapersLocked()
+	replaced := make([]*ownedScraper, 0, len(oldScrapers))
+	for _, old := range oldScrapers {
+		if current, exists := newScrapers[old.Instance()]; !exists || current != old {
+			replaced = append(replaced, old)
 		}
 	}
 
-	return nil
+	return replaced
+}
+
+func (m *manager) ownedScraperLocked(name string, child scraper.Scraper) *ownedScraper {
+	if m.ownedScrapers == nil {
+		m.ownedScrapers = make(map[string]*ownedScraper, len(m.scrapers))
+	}
+	owned, ok := m.ownedScrapers[name]
+	if !ok {
+		owned = newOwnedScraper(child)
+		m.ownedScrapers[name] = owned
+	}
+
+	return owned
 }
 
 type mockManager struct {
 	component.Mock
+}
+
+func (m *mockManager) Statuses(ctx context.Context) []scraper.Status {
+	args := m.Called(ctx)
+
+	return args.Get(0).([]scraper.Status)
+}
+
+func (m *mockManager) Refresh(name string) error {
+	return m.Called(name).Error(0)
 }
 
 func (m *mockManager) Reload(config *config.App) error {

@@ -145,8 +145,8 @@ $env:API_KEY = "sk-..."; docker-compose -p zenfeed up -d
 Access it at http://localhost:1400
 
 > [!WARNING]
-> *   If you deploy zenfeed on a public server like a VPS, access it via `http://<YOUR_IP>:1400` and ensure that your firewall/security group allows traffic on port `1400`.
-> *   **Security Notice:** zenfeed does not yet have an authentication mechanism. Exposing the service to the public internet may leak your `API_KEY`. Be sure to configure strict security group rules to allow access only from trusted IPs.
+> *   If you deploy zenfeed on a public server such as a VPS, do not expose ports `1400`, `1300`, `1301`, or `9090` directly. Put the Web UI behind an authenticated TLS reverse proxy; the default Compose configuration binds the Web UI and HTTP API to the host loopback interface only.
+> *   **Security Notice:** zenfeed does not provide built-in user authentication. Treat every reachable client as trusted and keep the management API and telemetry endpoints private.
 
 ### 3. Getting Started
 

@@ -16,8 +16,13 @@
 package http
 
 import (
+	"context"
 	"net"
 	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -37,12 +42,35 @@ type Server interface {
 }
 
 type Config struct {
-	Address string
+	Address        string
+	AllowedOrigins []string
 }
+
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 2 * time.Minute
+	idleTimeout       = 2 * time.Minute
+	shutdownTimeout   = 10 * time.Second
+	maxHeaderBytes    = 1 << 20
+)
+
+var defaultAllowedOrigins = []string{"http://localhost:1400", "http://127.0.0.1:1400"}
 
 func (c *Config) Validate() error {
 	if c.Address == "" {
-		c.Address = ":1300"
+		c.Address = "127.0.0.1:1300"
+	}
+	if c.AllowedOrigins == nil {
+		c.AllowedOrigins = append([]string(nil), defaultAllowedOrigins...)
+	}
+	for _, origin := range c.AllowedOrigins {
+		parsed, err := url.Parse(origin)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" ||
+			parsed.Fragment != "" || strings.Contains(origin, "*") {
+			return errors.Errorf("invalid allowed origin %q", origin)
+		}
 	}
 	if _, _, err := net.SplitHostPort(c.Address); err != nil {
 		return errors.Wrap(err, "invalid address")
@@ -53,6 +81,12 @@ func (c *Config) Validate() error {
 
 func (c *Config) From(app *config.App) *Config {
 	c.Address = app.API.HTTP.Address
+	if app.API.HTTP.AllowedOrigins == nil {
+		c.AllowedOrigins = nil
+	} else {
+		c.AllowedOrigins = make([]string, len(*app.API.HTTP.AllowedOrigins))
+		copy(c.AllowedOrigins, *app.API.HTTP.AllowedOrigins)
+	}
 
 	return c
 }
@@ -86,27 +120,39 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 		return nil, errors.Wrap(err, "validate config")
 	}
 
-	router := http.NewServeMux()
-	api := dependencies.API
-	router.Handle("/write", jsonrpc.API(api.Write))
-	router.Handle("/query_config", jsonrpc.API(api.QueryAppConfig))
-	router.Handle("/apply_config", jsonrpc.API(api.ApplyAppConfig))
-	router.Handle("/query_config_schema", jsonrpc.API(api.QueryAppConfigSchema))
-	router.Handle("/query_rsshub_categories", jsonrpc.API(api.QueryRSSHubCategories))
-	router.Handle("/query_rsshub_websites", jsonrpc.API(api.QueryRSSHubWebsites))
-	router.Handle("/query_rsshub_routes", jsonrpc.API(api.QueryRSSHubRoutes))
-	router.Handle("/query", jsonrpc.API(api.Query))
-	httpServer := &http.Server{Addr: config.Address, Handler: router}
-
-	return &server{
+	s := &server{
 		Base: component.New(&component.BaseConfig[Config, Dependencies]{
 			Name:         "HTTPServer",
 			Instance:     instance,
 			Config:       config,
 			Dependencies: dependencies,
 		}),
-		http: httpServer,
-	}, nil
+	}
+	router := http.NewServeMux()
+	api := dependencies.API
+	router.Handle("/write", jsonrpc.APIWithLimit(api.Write, jsonrpc.WriteMaxRequestBodyBytes))
+	router.Handle("/update_feed_labels", jsonrpc.API(api.UpdateFeedLabels))
+	router.Handle("/query_config", jsonrpc.API(api.QueryAppConfig))
+	router.Handle("/apply_config", jsonrpc.API(api.ApplyAppConfig))
+	router.Handle("/query_config_schema", jsonrpc.API(api.QueryAppConfigSchema))
+	router.Handle("/query_rsshub_categories", jsonrpc.API(api.QueryRSSHubCategories))
+	router.Handle("/query_rsshub_websites", jsonrpc.API(api.QueryRSSHubWebsites))
+	router.Handle("/query_rsshub_routes", jsonrpc.API(api.QueryRSSHubRoutes))
+	router.Handle("/query_source_statuses", jsonrpc.API(api.QuerySourceStatuses))
+	router.Handle("/refresh_source", jsonrpc.API(api.RefreshSource))
+	router.Handle("/query", jsonrpc.API(api.Query))
+	httpServer := &http.Server{
+		Addr:              config.Address,
+		Handler:           s.cors(router),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+	s.http = httpServer
+
+	return s, nil
 }
 
 // --- Implementation code block ---
@@ -115,13 +161,37 @@ type server struct {
 	http *http.Server
 }
 
+func (s *server) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Add("Vary", "Origin")
+			if !slices.Contains(s.Config().AllowedOrigins, origin) {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *server) Run() (err error) {
 	ctx := telemetry.StartWith(s.Context(), append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "Run")...)
 	defer func() { telemetry.End(ctx, err) }()
 
+	listener, err := net.Listen("tcp", s.http.Addr)
+	if err != nil {
+		return errors.Wrap(err, "listen")
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
-		serverErr <- s.http.ListenAndServe()
+		serverErr <- s.http.Serve(listener)
 	}()
 
 	s.MarkReady()
@@ -129,10 +199,27 @@ func (s *server) Run() (err error) {
 	case <-ctx.Done():
 		log.Info(ctx, "shutting down")
 
-		return s.http.Shutdown(ctx)
+		return shutdownHTTPServer(s.http)
 	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return errors.Wrap(err, "listen and serve")
 	}
+}
+
+func shutdownHTTPServer(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		if closeErr := server.Close(); closeErr != nil {
+			return errors.Wrapf(err, "shutdown server; force close: %v", closeErr)
+		}
+
+		return errors.Wrap(err, "shutdown server; connections force-closed")
+	}
+
+	return nil
 }
 
 func (s *server) Reload(app *config.App) error {

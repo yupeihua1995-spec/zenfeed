@@ -3,6 +3,7 @@ package vector
 import (
 	"bytes"
 	"context"
+	"math"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -249,6 +250,85 @@ func TestAdd(t *testing.T) {
 						Expect(hasFriends).To(BeTrue(), "Node should have friends")
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestAddRejectsInvalidVectors(t *testing.T) {
+	tests := []struct {
+		name   string
+		vector []float32
+	}{
+		{name: "NaN component", vector: []float32{1, float32(math.NaN())}},
+		{name: "positive infinity component", vector: []float32{1, float32(math.Inf(1))}},
+		{name: "negative infinity component", vector: []float32{1, float32(math.Inf(-1))}},
+		{name: "zero norm", vector: []float32{0, 0}},
+		{name: "underflowing norm", vector: []float32{math.SmallestNonzeroFloat32, 0}},
+		{name: "non-finite norm", vector: []float32{math.MaxFloat32, math.MaxFloat32}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			vectorIndex, err := NewFactory().New("test", &Config{}, Dependencies{})
+			g.Expect(err).NotTo(HaveOccurred())
+
+			err = vectorIndex.Add(context.Background(), 42, [][]float32{{1, 0}, tt.vector})
+
+			g.Expect(err).To(HaveOccurred())
+			concrete := vectorIndex.(*idx)
+			g.Expect(concrete.m).NotTo(HaveKey(uint64(42)))
+		})
+	}
+}
+
+func TestAddRejectsInvalidVectorForExistingID(t *testing.T) {
+	g := NewWithT(t)
+	vectorIndex, err := NewFactory().New("test", &Config{}, Dependencies{})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(vectorIndex.Add(context.Background(), 42, [][]float32{{1, 0}})).To(Succeed())
+
+	err = vectorIndex.Add(context.Background(), 42, [][]float32{{float32(math.NaN()), 0}})
+
+	g.Expect(err).To(HaveOccurred())
+	concrete := vectorIndex.(*idx)
+	g.Expect(concrete.m[42].vectors).To(Equal([][]float32{{1, 0}}))
+}
+
+func TestSearchRejectsInvalidVectors(t *testing.T) {
+	tests := []struct {
+		name   string
+		vector []float32
+	}{
+		{name: "NaN component", vector: []float32{1, float32(math.NaN())}},
+		{name: "positive infinity component", vector: []float32{1, float32(math.Inf(1))}},
+		{name: "negative infinity component", vector: []float32{1, float32(math.Inf(-1))}},
+		{name: "zero norm", vector: []float32{0, 0}},
+		{name: "underflowing norm", vector: []float32{math.SmallestNonzeroFloat32, 0}},
+		{name: "non-finite norm", vector: []float32{math.MaxFloat32, math.MaxFloat32}},
+	}
+
+	for _, populated := range []bool{false, true} {
+		indexState := "empty index"
+		if populated {
+			indexState = "populated index"
+		}
+		t.Run(indexState, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					g := NewWithT(t)
+					vectorIndex, err := NewFactory().New("test", &Config{}, Dependencies{})
+					g.Expect(err).NotTo(HaveOccurred())
+					if populated {
+						g.Expect(vectorIndex.Add(context.Background(), 1, [][]float32{{1, 0}})).To(Succeed())
+					}
+
+					results, err := vectorIndex.Search(context.Background(), tt.vector, 0, 10)
+
+					g.Expect(err).To(HaveOccurred())
+					g.Expect(results).To(BeNil())
+				})
 			}
 		})
 	}

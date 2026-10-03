@@ -2,7 +2,7 @@ services:
   zenfeed-web:
     image: glidea/zenfeed-web:latest
     ports:
-      - "1400:1400"
+      - "127.0.0.1:1400:1400"
     environment:
       - PUBLIC_DEFAULT_API_URL=http://zenfeed:1300
     depends_on:
@@ -29,17 +29,15 @@ services:
       - data:/app/data
       - config:/app/config
     ports:
-      - "1300:1300"
-      - "1301:1301"
-      - "9090:9090"
+      - "127.0.0.1:1300:1300"
     depends_on:
       - rsshub
     restart: unless-stopped
     
   rsshub:
     image: diygod/rsshub:2024-12-14
-    ports:
-      - "1200:1200"
+    expose:
+      - "1200"
     environment:
       - NODE_ENV=production
     restart: unless-stopped
@@ -52,6 +50,12 @@ configs:
   zenfeed_init_config: # After installation, you must modify the configuration through zenfeed or config volume.
     content: |
       timezone: ${TZ:-Asia/Shanghai}
+      api:
+        http:
+          address: 0.0.0.0:1300
+          allowed_origins:
+            - http://localhost:1400
+            - http://127.0.0.1:1400
       llms:
         - name: general
           default: true
@@ -67,6 +71,27 @@ configs:
       storage:
         feed:
           rewrites:
+            - source_label: content
+              skip_too_short_threshold: 40
+              transform:
+                to_text:
+                  llm: general
+                  prompt: |
+                    你是 AI 资讯分类系统。阅读输入内容后，只能从下面的受控标签中选择 1-3 个最相关的标签：
+
+                    核心主题：大语言模型、智能体、多模态、生成式媒体、计算机视觉、语音音频、机器人与具身、数据与检索、AI 编程、AI 基础设施。
+                    研发阶段：训练与微调、推理与部署、评测与基准、安全与对齐、网络与隐私。
+                    应用语境：产品发布、开源生态、企业应用、行业与商业、政策治理、科学与教育、自然与影像、观点评论、人物动态。
+
+                    规则：
+                    - 优先描述内容真正讨论的主题，而不是只根据文中出现的词匹配。
+                    - 通常选择 1-2 个核心主题；仅在确有必要时增加 1 个研发阶段或应用语境标签。
+                    - 不要输出“AI”“论文”“博客”“社交网络”等过宽或已由内容类型表达的信息。
+                    - 不要创建公司名、人物名、产品名、模型名或上述列表之外的新标签。
+                    - 如果内容只有链接、活动报名或信息不足，输出空字符串，不要猜测。
+                    - 只输出标签，使用英文逗号分隔，逗号前后不要空格，不要解释，不要使用 Markdown。
+              match_re: '^(大语言模型|智能体|多模态|生成式媒体|计算机视觉|语音音频|机器人与具身|数据与检索|AI 编程|AI 基础设施|训练与微调|推理与部署|评测与基准|安全与对齐|网络与隐私|产品发布|开源生态|企业应用|行业与商业|政策治理|科学与教育|自然与影像|观点评论|人物动态)([,，][[:space:]]*(大语言模型|智能体|多模态|生成式媒体|计算机视觉|语音音频|机器人与具身|数据与检索|AI 编程|AI 基础设施|训练与微调|推理与部署|评测与基准|安全与对齐|网络与隐私|产品发布|开源生态|企业应用|行业与商业|政策治理|科学与教育|自然与影像|观点评论|人物动态)){0,2}$'
+              label: tags
             - transform:
                 to_text:
                   prompt: |
